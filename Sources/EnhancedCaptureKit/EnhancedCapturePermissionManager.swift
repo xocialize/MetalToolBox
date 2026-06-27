@@ -24,7 +24,7 @@ protocol PermissionManagerDelegate: AnyObject {
 // MARK: - PermissionManager
 
 @available(macOS 14.0, iOS 16.0, *)
-class PermissionManager {
+class PermissionManager: @unchecked Sendable {
 
     private weak var delegate: PermissionManagerDelegate?
 

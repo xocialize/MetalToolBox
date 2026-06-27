@@ -50,6 +50,7 @@ public final class VideoMerge: Sendable {
     /// - Parameter urls: Ordered list of local file URLs to merge. Chunk order matters.
     /// - Returns: An AVPlayerItem backed by the in-memory composition, ready for playback.
     /// - Throws: ``VideoMergeError`` if composition fails.
+    @MainActor
     public func compose(urls: [URL]) async throws -> AVPlayerItem {
         guard !urls.isEmpty else {
             throw VideoMergeError.emptyURLList

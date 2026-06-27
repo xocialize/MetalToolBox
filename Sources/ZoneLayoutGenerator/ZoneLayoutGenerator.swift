@@ -211,31 +211,6 @@ public class ZoneLayoutGenerator: NSObject {
             calculatedHeight: fitResult.height
         )
 
-        // DEBUG: Only print when values change for this zone
-        let usedRenderSafe = (fitResult.width != directFit.width || fitResult.height != directFit.height)
-        let snapshot = ZLGDebugSnapshot(
-            zoneIdentifier: zoneConfig.zoneBaseConfig.identifier,
-            inputWidth: originalZoneSize.width,
-            inputHeight: originalZoneSize.height,
-            renderCanvasWidth: renderCanvas.width,
-            renderCanvasHeight: renderCanvas.height,
-            hConstraint: hStr,
-            resolvedH: resolvedH,
-            vConstraint: vStr,
-            resolvedV: resolvedV,
-            workingCanvasWidth: workingCanvas.width,
-            workingCanvasHeight: workingCanvas.height,
-            renderSafeApplied: usedRenderSafe,
-            fitWidth: fitResult.width,
-            fitHeight: fitResult.height,
-            fitScale: fitResult.scale,
-            xPosition: xPosition,
-            yPosition: yPosition,
-            aliasZone: zoneAlias.zone,
-            aliasModifierWidth: zoneAlias.canvasModifier.width,
-            aliasModifierHeight: zoneAlias.canvasModifier.height
-        )
-
         return ZLGWorkingSet(calculatedZoneLayout: calculatedZone, zoneAlias: zoneAlias)
     }
 

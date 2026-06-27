@@ -22,7 +22,7 @@ protocol EnhancedCaptureScreenDelegate: AnyObject {
 
 // MARK: - CaptureScreen
 
-public class EnhancedCaptureScreen: NSObject {
+public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
     
     // MARK: - CaptureSource / displayID
     
@@ -123,14 +123,10 @@ public class EnhancedCaptureScreen: NSObject {
         // Stop the stream synchronously if possible
         // Note: We cannot await in deinit, so we use a blocking approach
         if let stream = stream, isCaptureActive {
-            // Best effort cleanup - detached task for async cleanup
-            Task.detached { [weak stream] in
-                guard let stream else { return }
-                do {
-                    try await stream.stopCapture()
-                } catch {
-                    // Error during cleanup - nothing we can do in deinit
-                }
+            // Best-effort cleanup. Use the completion-handler variant so we don't
+            // have to send the non-Sendable SCStream into a detached task.
+            stream.stopCapture { _ in
+                // Error during cleanup - nothing we can do in deinit
             }
         }
         
@@ -216,7 +212,7 @@ public class EnhancedCaptureScreen: NSObject {
     /// Stops screen capture with an optional completion callback.
     /// Use the completion variant when cleanup ordering matters (e.g., screenLost
     /// needs to remove the screen from the array only after the stream has stopped).
-    func stopCapture(completion: (() -> Void)?) {
+    func stopCapture(completion: (@Sendable () -> Void)?) {
         guard let stream = stream else {
             mlog.debug("[CaptureKitScreen] No active stream to stop")
             completion?()

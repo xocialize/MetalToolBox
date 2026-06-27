@@ -494,7 +494,7 @@ public class TextureCompositorEngine {
         }
 
         // === Phase 1: MPS scale each zone's source → compositeTexture ===
-        for (index, snapshot) in snapshots.enumerated() {
+        for snapshot in snapshots {
             guard let source = snapshot.sourceTexture,
                   let destination = snapshot.compositeTexture,
                   let position = snapshot.pixelPosition,
@@ -524,26 +524,6 @@ public class TextureCompositorEngine {
                 scaleY: Double(mpsScale),
                 translateX: Double(offsetX),
                 translateY: Double(offsetY)
-            )
-
-            // DEBUG: Only print when MPS parameters change for this zone
-            let renderSnapshot = FZCEDebugSnapshot(
-                sourceWidth: source.width,
-                sourceHeight: source.height,
-                destinationWidth: destination.width,
-                destinationHeight: destination.height,
-                frameWidth: size.width,
-                frameHeight: size.height,
-                frameX: position.x,
-                frameY: position.y,
-                scaleX: transform.scaleX,
-                scaleY: transform.scaleY,
-                translateX: transform.translateX,
-                translateY: transform.translateY,
-                scaledW: scaledW,
-                scaledH: scaledH,
-                offsetX: offsetX,
-                offsetY: offsetY
             )
 
             withUnsafePointer(to: &transform) { ptr in

@@ -37,7 +37,7 @@ public extension EnhancedCaptureDelegate {
 }
 
 @available(macOS 10.15, iOS 16.0, *)
-public final class EnhancedCaptureKit: AVCaptureSession {
+public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     
     // MARK: - Properties
     
@@ -193,7 +193,7 @@ public final class EnhancedCaptureKit: AVCaptureSession {
     /// Use this when you need to sequence stop→start (e.g., iOS device switching where
     /// macOS limits capture to one iOS device at a time).
     /// The completion fires on the main thread after the device has been fully removed from the session.
-    public func disableCapture(for source: EnhancedCaptureSource, completion: @escaping () -> Void) {
+    public func disableCapture(for source: EnhancedCaptureSource, completion: @escaping @Sendable () -> Void) {
         mlog.info("Disabling capture for source: \(source.displayName) (type: \(String(describing: source.type)))")
         enabledSources.remove(source.id)
 
@@ -277,7 +277,7 @@ public final class EnhancedCaptureKit: AVCaptureSession {
         }
     }
     
-    private func removeFromSession(captureDevice: EnhancedCaptureDevice, completion: @escaping () -> Void) {
+    private func removeFromSession(captureDevice: EnhancedCaptureDevice, completion: @escaping @Sendable () -> Void) {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
             

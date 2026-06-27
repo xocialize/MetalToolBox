@@ -26,7 +26,7 @@ protocol EnhancedCaptureCameraControllerDelegate: AnyObject {
 // MARK: - CameraController
 
 @available(iOS 17.0, *)
-class EnhancedCaptureCameraController: NSObject {
+class EnhancedCaptureCameraController: NSObject, @unchecked Sendable {
 
     private weak var delegate: EnhancedCaptureCameraControllerDelegate?
 

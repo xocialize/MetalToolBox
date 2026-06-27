@@ -33,7 +33,7 @@ protocol EnhancedCaptureDeviceDelegate: AnyObject {
 
 // MARK: - CaptureKitDevice
 
-class EnhancedCaptureDevice: NSObject {
+class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     
     // MARK: - CaptureSource
     

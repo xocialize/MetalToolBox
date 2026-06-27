@@ -35,7 +35,7 @@ public protocol VideoPlayerDelegate: AnyObject {
     func videoPlayerDidCompleteLoop(identifier: String)
 }
 
-public class VideoPlayer: NSObject {
+public class VideoPlayer: NSObject, @unchecked Sendable {
 
     public weak var delegate: VideoPlayerDelegate?
 
@@ -60,7 +60,7 @@ public class VideoPlayer: NSObject {
     
     public var videoUrl: URL?  {
         didSet{
-            guard let videoUrl else {
+            guard videoUrl != nil else {
                 stopVideo()
                 lastPixelBuffer = nil
                 return
@@ -235,7 +235,7 @@ public class VideoPlayer: NSObject {
 
     /// Asynchronous buffer check using dedicated processing queue
     /// Calls completion handler with pixel buffer on the processing queue
-    public func asyncBufferCheck(completion: @escaping (CVPixelBuffer?) -> Void) {
+    public func asyncBufferCheck(completion: @escaping @Sendable (CVPixelBuffer?) -> Void) {
         processingQueue.async { [weak self] in
             guard let self = self else {
                 completion(nil)
