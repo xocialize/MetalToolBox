@@ -36,30 +36,48 @@ public extension EnhancedCaptureDelegate {
     func enhancedCapture(_ manager: EnhancedCaptureKit, permissionStatusDidChange type: PermissionType, status: PermissionStatus) {}
 }
 
+/// ── Threading contract ────────────────────────────────────────────────
+/// Discovery state (`captureScreens` / `captureDevices` / `captureSources` /
+/// `enabledSources`) is MAIN-ACTOR confined: every mutation path — init-time
+/// discovery, screen/device observers, lost-device completions, and the
+/// public enable/disable API — funnels onto the main actor, and the
+/// `captureSourceListDidChange` / `enhancedCaptureDidInitialize` delegate
+/// callbacks are always delivered there, always AFTER `init(delegate:)` has
+/// returned (a callback during init reaches a consumer whose stored
+/// reference is still nil). The sample-buffer hot path never touches those
+/// arrays: it routes through a lock-guarded snapshot rebuilt on each emit.
+/// Session plumbing stays on `sessionQueue`. `@unchecked Sendable` reflects
+/// this manual confinement, not an absence of shared state.
 @available(macOS 10.15, iOS 16.0, *)
 public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
-    
+
     // MARK: - Properties
-    
+
     public weak var delegate: EnhancedCaptureDelegate?
-    
+
     // Internal for access from extension files (CaptureObservers.swift)
     var observers: [NSObjectProtocol] = []
-    
+
     // MARK: - MacOS only ScreenCaptureKit
     #if os(macOS)
     private var captureScreens: [EnhancedCaptureScreen] = []
     #endif
-    
+
     public var captureSources: [EnhancedCaptureSource] = []
     private var captureDevices: [EnhancedCaptureDevice] = []
-    
+
     // Track which sources are currently enabled/capturing
     private var enabledSources: Set<String> = []
-    
+
+    // Hot-path routing snapshot: deviceVideoBuffer() runs on capture callback
+    // queues at frame rate and must not scan `captureDevices` while the main
+    // actor mutates it. Rebuilt under the lock on every emit.
+    private let routingLock = NSLock()
+    private var routingByDeviceUniqueID: [String: EnhancedCaptureSource] = [:]
+
     private let sessionQueue = DispatchQueue(label: "com.mvs.captureManager.sessionQueue", qos: .userInteractive)
     private var permissionManager: PermissionManager?
-    
+
     public convenience init(delegate: EnhancedCaptureDelegate) {
         self.init()
         self.delegate = delegate
@@ -67,7 +85,11 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         #if os(iOS)
         if #unavailable(iOS 17.0) {
             mlog.notice("CaptureKit requires iOS 17.0 or later — current device is unsupported")
-            delegate.enhancedCaptureDidInitialize(self)
+            // Even the unsupported path defers: no delegate call before init returns.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.delegate?.enhancedCaptureDidInitialize(self)
+            }
             return
         }
         #endif
@@ -76,17 +98,27 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
 
         setupCaptureKit()
 
-        // Check permissions — session start is deferred until camera is authorized
-        permissionManager = PermissionManager(delegate: self)
-        permissionManager?.checkPermissions()
-
-        // Device discovery can proceed immediately (populates device list
-        // so sources are ready when session starts)
-        refreshDevices()
+        // ALL discovery + permission resolution is deferred past init. The
+        // permission check can resolve synchronously (already authorized or
+        // denied) and device discovery emits per device found — either would
+        // otherwise call the delegate while the consumer's assignment of this
+        // instance is still evaluating.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Check permissions — session start is deferred until camera is authorized
+            self.permissionManager = PermissionManager(delegate: self)
+            self.permissionManager?.checkPermissions()
+            // Device discovery (populates device list so sources are ready
+            // when the session starts)
+            self.refreshDevices()
+            #if os(macOS)
+            await self.screensDidUpdate()
+            #endif
+        }
 
         mlog.debug("Initialization pending permission resolution")
     }
-    
+
     // MARK: - CaptureKit Setup
     func setupCaptureKit() {
         mlog.debug("Setting up capture components")
@@ -94,19 +126,50 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         enableIOSDevices()
         #endif
         enableObservers()
-        // This should happen automatically from the observer but it shouldn't hurt to do it here just in case the observer doesn't fire.
-        #if os(macOS)
-        Task {
-            await screensDidUpdate()
-        }
-        #endif
-        // Note: refreshDevices() is called after setup in init
+        // Note: first screens pass + refreshDevices() run from init's deferred
+        // main-actor task — never synchronously inside init.
         mlog.debug("Capture components setup complete")
+    }
+
+    // MARK: - Main-actor funnel
+
+    /// Runs `body` isolated to the main actor: synchronously when already on
+    /// the main thread (preserving the pre-existing call-site ordering for
+    /// main-thread callers), else hopping via a Task. The `#available` guard
+    /// exists only for the iOS 16 slice (assumeIsolated is iOS 17+); the kit
+    /// itself already requires iOS 17 at runtime.
+    func runOnMainActor(_ body: @escaping @MainActor @Sendable (EnhancedCaptureKit) -> Void) {
+        if Thread.isMainThread, #available(iOS 17.0, macOS 14.0, tvOS 17.0, *) {
+            MainActor.assumeIsolated { body(self) }
+        } else {
+            Task { @MainActor in body(self) }
+        }
     }
     
     // MARK: - Capture enable/disable
-    
+
+    // Public wrappers keep the pre-confinement signatures (callable from any
+    // thread); the isolated implementations own the state. Main-thread callers
+    // run synchronously, exactly as before.
+
     public func enableCapture(for source: EnhancedCaptureSource) {
+        runOnMainActor { $0.enableCaptureIsolated(for: source) }
+    }
+
+    public func disableCapture(for source: EnhancedCaptureSource) {
+        runOnMainActor { $0.disableCaptureIsolated(for: source) }
+    }
+
+    /// Disables capture for the given source with a completion callback.
+    /// Use this when you need to sequence stop→start (e.g., iOS device switching where
+    /// macOS limits capture to one iOS device at a time).
+    /// The completion fires on the main thread after the device has been fully removed from the session.
+    public func disableCapture(for source: EnhancedCaptureSource, completion: @escaping @Sendable () -> Void) {
+        runOnMainActor { $0.disableCaptureIsolated(for: source, completion: completion) }
+    }
+
+    @MainActor
+    private func enableCaptureIsolated(for source: EnhancedCaptureSource) {
         // Check if already enabled to prevent duplicate additions
         guard !enabledSources.contains(source.id) else {
             mlog.debug("Capture already enabled for: \(source.displayName)")
@@ -153,7 +216,8 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
     }
 
-    public func disableCapture(for source: EnhancedCaptureSource) {
+    @MainActor
+    private func disableCaptureIsolated(for source: EnhancedCaptureSource) {
         mlog.info("Disabling capture for source: \(source.displayName) (type: \(String(describing: source.type)))")
 
         // Remove from enabled sources set
@@ -189,11 +253,8 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
     }
 
-    /// Disables capture for the given source with a completion callback.
-    /// Use this when you need to sequence stop→start (e.g., iOS device switching where
-    /// macOS limits capture to one iOS device at a time).
-    /// The completion fires on the main thread after the device has been fully removed from the session.
-    public func disableCapture(for source: EnhancedCaptureSource, completion: @escaping @Sendable () -> Void) {
+    @MainActor
+    private func disableCaptureIsolated(for source: EnhancedCaptureSource, completion: @escaping @Sendable () -> Void) {
         mlog.info("Disabling capture for source: \(source.displayName) (type: \(String(describing: source.type)))")
         enabledSources.remove(source.id)
 
@@ -334,7 +395,8 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     // MARK: - Screen Discovery
 #if os(macOS)
     private var isUpdatingScreens = false
-    
+
+    @MainActor
     func screensDidUpdate() async {
         // Prevent concurrent calls to this method
         guard !isUpdatingScreens else {
@@ -383,6 +445,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
 
     }
     
+    @MainActor
     private func screenFound(displayId: CGDirectDisplayID) {
         // Double-check that this display isn't already in the array
         guard !captureScreens.contains(where: { $0.displayID == displayId }) else {
@@ -400,6 +463,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         mlog.debug("Added screen to captureScreens array. Total screens: \(self.captureScreens.count)")
         emitCaptureSources()
     }
+    @MainActor
     private func screenLost(displayId: CGDirectDisplayID) {
         mlog.info("Lost display: \(displayId)")
 
@@ -413,26 +477,29 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         let captureScreen = captureScreens[index]
 
         // Stop capture with completion — ensures the stream is fully stopped before
-        // the screen is removed from the array and deallocated.
+        // the screen is removed from the array and deallocated. The completion
+        // arrives on the stream's own queue; state mutation hops back to main.
         captureScreen.stopCapture { [weak self] in
             guard let self = self else { return }
+            self.runOnMainActor { kit in
+                // Remove the capture source from the sources array if it exists
+                if let captureSource = captureScreen.captureSource {
+                    kit.captureSources.removeAll { $0.id == captureSource.id }
+                    mlog.debug("Removed capture source: \(captureSource.displayName)")
+                }
 
-            // Remove the capture source from the sources array if it exists
-            if let captureSource = captureScreen.captureSource {
-                self.captureSources.removeAll { $0.id == captureSource.id }
-                mlog.debug("Removed capture source: \(captureSource.displayName)")
+                // Remove from the array (this releases the strong reference)
+                kit.captureScreens.removeAll { $0.displayID == displayId }
+
+                mlog.debug("Successfully removed screen capture for display: \(displayId)")
+
+                kit.emitCaptureSources()
             }
-
-            // Remove from the array (this releases the strong reference)
-            self.captureScreens.removeAll { $0.displayID == displayId }
-
-            mlog.debug("Successfully removed screen capture for display: \(displayId)")
-
-            self.emitCaptureSources()
         }
     }
 #endif
     
+    @MainActor
     func emitCaptureSources() {
         var emittableList = [EnhancedCaptureSource]()
         var seenIDs = Set<String>()
@@ -480,6 +547,18 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
 
         // Update the captureSources array
         captureSources = emittableList
+
+        // Rebuild the hot-path routing snapshot (read by deviceVideoBuffer on
+        // capture callback queues — it must never scan the live arrays).
+        var routing: [String: EnhancedCaptureSource] = [:]
+        for device in captureDevices {
+            if let source = device.captureSource {
+                routing[device.device.uniqueID] = source
+            }
+        }
+        routingLock.lock()
+        routingByDeviceUniqueID = routing
+        routingLock.unlock()
 
         mlog.debug("Emitting \(emittableList.count) unique capture source(s)")
         for (index, source) in emittableList.enumerated() {
@@ -533,6 +612,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         return uniqueDevices
     }
 
+    @MainActor
     private func refreshDevices() {
         let devices = availableDevices()
         mlog.debug("Found \(devices.count) available capture device(s)")
@@ -584,6 +664,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     // MARK: - Device Event Handlers
 
     // Internal for access from extension files (CaptureObservers.swift)
+    @MainActor
     func deviceFound(device: AVCaptureDevice) {
         // Check if device already exists in the array
         if captureDevices.contains(where: { $0.device.uniqueID == device.uniqueID }) {
@@ -657,6 +738,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     }
 
     // Internal for access from extension files (CaptureObservers.swift)
+    @MainActor
     func deviceLost(device: AVCaptureDevice) {
         mlog.info("Device lost: \(device.localizedName) (model: \(device.modelID))")
 
@@ -674,28 +756,31 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         // during the async session removal below
         captureDevice.removeObservers()
 
-        // Remove device from session if it's currently active
+        // Remove device from session if it's currently active. The completion
+        // arrives via DispatchQueue.main.async from sessionQueue; state
+        // mutation re-enters main-actor isolation through the funnel.
         removeFromSession(captureDevice: captureDevice) { [weak self] in
             guard let self = self else { return }
+            self.runOnMainActor { kit in
+                // Prepare device for removal (clears connections, components — observers already removed)
+                captureDevice.prepareForRemoval()
 
-            // Prepare device for removal (clears connections, components — observers already removed)
-            captureDevice.prepareForRemoval()
+                // Remove from the array by uniqueID (safer than index which may shift)
+                kit.captureDevices.removeAll { $0.device.uniqueID == deviceUniqueID }
 
-            // Remove from the array by uniqueID (safer than index which may shift)
-            self.captureDevices.removeAll { $0.device.uniqueID == deviceUniqueID }
+                // Clean up enabledSources so the device can be re-enabled on reconnect.
+                // Without this, enableCapture() would see the stale ID and no-op,
+                // preventing frames from flowing after a disconnect/reconnect cycle.
+                if let sourceId {
+                    kit.enabledSources.remove(sourceId)
+                    mlog.debug("Cleared enabledSources for disconnected device")
+                }
 
-            // Clean up enabledSources so the device can be re-enabled on reconnect.
-            // Without this, enableCapture() would see the stale ID and no-op,
-            // preventing frames from flowing after a disconnect/reconnect cycle.
-            if let sourceId {
-                self.enabledSources.remove(sourceId)
-                mlog.debug("Cleared enabledSources for disconnected device")
+                mlog.debug("Successfully removed device. Total devices: \(kit.captureDevices.count)")
+
+                // Emit updated sources list
+                kit.emitCaptureSources()
             }
-
-            mlog.debug("Successfully removed device. Total devices: \(self.captureDevices.count)")
-
-            // Emit updated sources list
-            self.emitCaptureSources()
         }
     }
     
@@ -720,9 +805,13 @@ extension EnhancedCaptureKit: EnhancedCaptureDeviceDelegate {
             return
         }
 
-        // Find the CaptureKitSource for this device to determine routing
-        if let captureDevice = captureDevices.first(where: { $0.device.uniqueID == uniqueID }),
-           let source = captureDevice.captureSource {
+        // Frame-rate hot path on a capture callback queue: route via the
+        // lock-guarded snapshot, never the main-actor-mutated arrays.
+        routingLock.lock()
+        let routedSource = routingByDeviceUniqueID[uniqueID]
+        routingLock.unlock()
+
+        if let source = routedSource {
 
             if source.type == .iOSDevice {
                 // iOS device frames → dedicated delegate (BezelManager pipeline)
@@ -767,14 +856,12 @@ extension EnhancedCaptureKit: PermissionManagerDelegate {
                 }
             } else {
                 mlog.error("Camera permission \(String(describing: status)) — session will not start")
-                // Still notify initialization complete (with no active session)
-                if Thread.isMainThread {
-                    delegate?.enhancedCaptureDidInitialize(self)
-                } else {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self = self else { return }
-                        self.delegate?.enhancedCaptureDidInitialize(self)
-                    }
+                // Still notify initialization complete (with no active session).
+                // Always asynchronous: a synchronous resolution must never let
+                // this reach the delegate before init(delegate:) has returned.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.enhancedCaptureDidInitialize(self)
                 }
             }
 

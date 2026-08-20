@@ -95,7 +95,8 @@ extension EnhancedCaptureKit {
             queue: .main
         ) { [weak self] notification in
             guard let device = notification.object as? AVCaptureDevice else { return }
-            self?.deviceLost(device: device)
+            // Delivered on .main; the funnel enters main-actor isolation.
+            self?.runOnMainActor { $0.deviceLost(device: device) }
         }
         observers.append(observer)
     }
@@ -107,7 +108,8 @@ extension EnhancedCaptureKit {
             queue: .main
         ) { [weak self] notification in
             guard let device = notification.object as? AVCaptureDevice else { return }
-            self?.deviceFound(device: device)
+            // Delivered on .main; the funnel enters main-actor isolation.
+            self?.runOnMainActor { $0.deviceFound(device: device) }
         }
         observers.append(observer)
     }
