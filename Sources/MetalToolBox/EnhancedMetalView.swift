@@ -32,7 +32,7 @@ import AppKit
 /// - Cross-platform support: macOS, iOS, iPadOS, tvOS
 /// - Thread-safe texture updates
 /// - Triple-buffered rendering (prevents frame drops)
-/// - Aspect-fit display (maintains texture aspect ratio)
+/// - Opt-in aspect-fit display (`maintainAspectRatio`; fills the drawable by default)
 /// - Timer-driven drawing at 60 FPS
 /// - Minimal API surface
 @available(macOS 14.0, iOS 16.0, tvOS 18.0, *)
@@ -62,8 +62,14 @@ public class EnhancedMetalView: MTKView {
         }
     }
 
-    /// Whether to maintain aspect ratio when displaying texture
-    public var maintainAspectRatio: Bool = true
+    /// OPT-IN aspect fit: letterbox/pillarbox the texture inside the drawable
+    /// (the clear colour paints the padding). Off by default on purpose — the
+    /// view's primary job is the signage output, where the compositor hands it
+    /// a canvas that ALREADY fits the target screen at whatever size that
+    /// screen is, so filling the drawable is the contract there. Preview
+    /// surfaces showing arbitrary content (an editor stage, a square well)
+    /// turn this on.
+    public var maintainAspectRatio: Bool = false
 
     /// Rotation angle in radians applied to the displayed texture.
     /// Default is `0` (no rotation). Set to `-Float.pi / 2` for -90° rotation.
@@ -305,6 +311,43 @@ public class EnhancedMetalView: MTKView {
     }
 }
 
+// MARK: - Aspect fit
+
+extension EnhancedMetalView {
+
+    /// The largest rectangle of `content`'s aspect that fits centred in
+    /// `bounds` — the letterbox/pillarbox placement. Degenerate inputs fall
+    /// back to the whole of `bounds` (stretch) rather than a zero rectangle.
+    public static func aspectFitRect(content: CGSize, in bounds: CGSize) -> CGRect {
+        guard content.width > 0, content.height > 0, bounds.width > 0, bounds.height > 0 else {
+            return CGRect(origin: .zero, size: bounds)
+        }
+        let contentAspect = content.width / content.height
+        let boundsAspect = bounds.width / bounds.height
+        let size: CGSize = boundsAspect > contentAspect
+            ? CGSize(width: bounds.height * contentAspect, height: bounds.height)   // pillarbox
+            : CGSize(width: bounds.width, height: bounds.width / contentAspect)     // letterbox
+        return CGRect(x: (bounds.width - size.width) / 2,
+                      y: (bounds.height - size.height) / 2,
+                      width: size.width, height: size.height)
+    }
+
+    /// `aspectFitRect` as a Metal viewport, in drawable pixels. A rotation of an
+    /// odd multiple of 90° swaps the content's aspect (the rotated vertex shader
+    /// turns the quad within the viewport, so the viewport must be shaped for
+    /// the TURNED image); other angles fit the unrotated aspect.
+    static func fittedViewport(contentSize: CGSize, drawableSize: CGSize, rotation: Float) -> MTLViewport {
+        let quarterTurns = Int((Double(rotation) / (Double.pi / 2)).rounded())
+        let turnedContent = quarterTurns % 2 != 0
+            ? CGSize(width: contentSize.height, height: contentSize.width)
+            : contentSize
+        let rect = aspectFitRect(content: turnedContent, in: drawableSize)
+        return MTLViewport(originX: Double(rect.origin.x), originY: Double(rect.origin.y),
+                           width: Double(rect.width), height: Double(rect.height),
+                           znear: 0, zfar: 1)
+    }
+}
+
 // MARK: - MTKViewDelegate
 
 @available(macOS 14.0, iOS 16.0, tvOS 18.0, *)
@@ -355,6 +398,15 @@ extension EnhancedMetalView: MTKViewDelegate {
         }
 
         if let texture = capturedTexture {
+            if maintainAspectRatio {
+                // Aspect-fit by VIEWPORT: the full-screen quad lands in the
+                // fitted rectangle and the pass's clear colour is the
+                // letterbox/pillarbox. No extra pass, no copy, any view shape.
+                commandEncoder.setViewport(Self.fittedViewport(
+                    contentSize: CGSize(width: texture.width, height: texture.height),
+                    drawableSize: view.drawableSize,
+                    rotation: rotation))
+            }
             commandEncoder.setFragmentTexture(texture, index: 0)
             commandEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: 1)
         }
