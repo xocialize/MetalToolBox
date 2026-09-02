@@ -55,8 +55,23 @@ final class MetalViewTests: XCTestCase {
         if #available(macOS 14.0, iOS 16.0, tvOS 18.0, *) {
             let view = EnhancedMetalView(device: device)
             XCTAssertNotNil(view.device)
-            XCTAssertTrue(view.maintainAspectRatio)
+            // Aspect-fit is opt-in: the view fills the drawable by default.
+            XCTAssertFalse(view.maintainAspectRatio)
             XCTAssertNil(view.displayTexture)
+        }
+    }
+
+    func testMetalViewMaintainAspectRatioOptIn() {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return
+        }
+
+        if #available(macOS 14.0, iOS 16.0, tvOS 18.0, *) {
+            let view = EnhancedMetalView(device: device)
+            view.maintainAspectRatio = true
+            XCTAssertTrue(view.maintainAspectRatio)
+            view.maintainAspectRatio = false
+            XCTAssertFalse(view.maintainAspectRatio)
         }
     }
 
