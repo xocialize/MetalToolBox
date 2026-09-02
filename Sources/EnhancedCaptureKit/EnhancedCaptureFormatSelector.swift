@@ -21,6 +21,9 @@ struct EnhancedCaptureFormatCandidate: Equatable {
     /// iOS: the sensor is pixel-binned for this format (lower quality, higher
     /// fps). Always `false` on macOS.
     var isBinned: Bool = false
+    /// iOS: the format can run inside an `AVCaptureMultiCamSession`. Always
+    /// `true` on macOS, which has no multi-camera session.
+    var isMultiCamSupported: Bool = true
 
     var pixelArea: Int { Int(width) * Int(height) }
 
@@ -40,8 +43,10 @@ enum EnhancedCaptureFormatSelector {
     /// Index of the best candidate for `preference`, or `nil` when `candidates` is empty.
     ///
     /// Rules, in order:
+    /// 0. With `requireMultiCamSupport`, drop candidates that cannot run in a
+    ///    multi-camera session (no fallback: such a format cannot be used).
     /// 1. Keep only candidates supporting `preferredFrameRate` (fall back to
-    ///    all candidates if none do).
+    ///    all remaining candidates if none do).
     /// 2. With a `preferredSize`, prefer candidates that cover it, choosing the
     ///    one with the least excess area; if none cover it, the largest.
     /// 3. Without a size, the largest area.
@@ -49,11 +54,16 @@ enum EnhancedCaptureFormatSelector {
     ///    earlier index (device order is stable and usually preferred-first).
     static func bestIndex(
         among candidates: [EnhancedCaptureFormatCandidate],
-        preference: EnhancedCaptureVideoPreference
+        preference: EnhancedCaptureVideoPreference,
+        requireMultiCamSupport: Bool = false
     ) -> Int? {
         guard !candidates.isEmpty else { return nil }
 
         var pool = Array(candidates.indices)
+        if requireMultiCamSupport {
+            pool = pool.filter { candidates[$0].isMultiCamSupported }
+            guard !pool.isEmpty else { return nil }
+        }
         if let fps = preference.preferredFrameRate {
             let fpsPool = pool.filter { candidates[$0].supports(frameRate: fps) }
             if !fpsPool.isEmpty { pool = fpsPool }
@@ -109,11 +119,14 @@ extension AVCaptureDevice.Format {
         let ranges = videoSupportedFrameRateRanges.map { $0.minFrameRate...$0.maxFrameRate }
         #if os(iOS)
         let binned = isVideoBinned
+        let multiCam = isMultiCamSupported
         #else
         let binned = false
+        let multiCam = true
         #endif
         return EnhancedCaptureFormatCandidate(
-            width: dims.width, height: dims.height, frameRateRanges: ranges, isBinned: binned
+            width: dims.width, height: dims.height, frameRateRanges: ranges,
+            isBinned: binned, isMultiCamSupported: multiCam
         )
     }
 }
@@ -122,14 +135,18 @@ extension AVCaptureDevice {
 
     /// Applies `preference` to the device: selects the best format and, when a
     /// frame rate is requested, locks the min/max frame duration to it.
-    /// Returns the chosen format, or `nil` when the device has none.
+    /// With `requireMultiCamSupport` only formats an `AVCaptureMultiCamSession`
+    /// accepts are considered. Returns the chosen format, or `nil` when the
+    /// device has no usable format.
     @discardableResult
-    func applyVideoPreference(_ preference: EnhancedCaptureVideoPreference) throws -> AVCaptureDevice.Format? {
+    func applyVideoPreference(_ preference: EnhancedCaptureVideoPreference, requireMultiCamSupport: Bool = false) throws -> AVCaptureDevice.Format? {
         let videoFormats = formats.filter {
             CMFormatDescriptionGetMediaType($0.formatDescription) == kCMMediaType_Video
         }
         let candidates = videoFormats.map(\.enhancedCandidate)
-        guard let index = EnhancedCaptureFormatSelector.bestIndex(among: candidates, preference: preference) else {
+        guard let index = EnhancedCaptureFormatSelector.bestIndex(
+            among: candidates, preference: preference, requireMultiCamSupport: requireMultiCamSupport
+        ) else {
             return nil
         }
         let format = videoFormats[index]

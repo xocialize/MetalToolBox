@@ -74,7 +74,7 @@ extension EnhancedCaptureKit {
     private func addSessionStartObserver() {
         let observer = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.didStartRunningNotification,
-            object: self,
+            object: session,
             queue: nil
         ) { _ in
             mlog.debug("Capture session started")
@@ -85,7 +85,7 @@ extension EnhancedCaptureKit {
     private func addSessionStopObserver() {
         let observer = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.didStopRunningNotification,
-            object: self,
+            object: session,
             queue: nil
         ) { _ in
             mlog.debug("Capture session stopped")
@@ -96,7 +96,7 @@ extension EnhancedCaptureKit {
     private func addRuntimeErrorObserver() {
         let observer = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification,
-            object: self,
+            object: session,
             queue: .main
         ) { [weak self] notification in
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
@@ -110,7 +110,7 @@ extension EnhancedCaptureKit {
     private func addInterruptionObservers() {
         let began = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.wasInterruptedNotification,
-            object: self,
+            object: session,
             queue: .main
         ) { [weak self] notification in
             let rawReason = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
@@ -120,7 +120,7 @@ extension EnhancedCaptureKit {
 
         let ended = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.interruptionEndedNotification,
-            object: self,
+            object: session,
             queue: .main
         ) { [weak self] _ in
             self?.runOnMainActor { $0.handleSessionInterruption(.ended) }

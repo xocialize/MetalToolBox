@@ -29,6 +29,7 @@ protocol EnhancedCaptureDeviceDelegate: AnyObject {
     func deviceAudioBuffer(sampleBuffer: CMSampleBuffer, uniqueID: String)
     func deviceAudioLevel(_ level: EnhancedCaptureAudioLevel, uniqueID: String)
     func deviceVideoRotationAngleDidChange(_ angle: CGFloat, uniqueID: String)
+    func deviceSystemPressureDidChange(level: String, isElevated: Bool, uniqueID: String)
     func devicePreviewLayer(previewLayer: AVCaptureVideoPreviewLayer, model: String)
 }
 
@@ -97,6 +98,7 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     /// Angle currently applied to the video connection, so the kit can report
     /// it once the device is registered (the first KVO fires during `init`).
     private(set) var videoRotationAngle: CGFloat?
+    private var systemPressureObservation: NSKeyValueObservation?
     #endif
 
     // MARK: - Initialization
@@ -198,6 +200,7 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         setupAudio()
         #if os(iOS)
         setupRotationCoordinator()
+        setupSystemPressureObserver()
         #endif
     }
 
@@ -240,15 +243,23 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     /// iOS / tvOS reset `activeFormat` and the frame-duration lock when an
     /// input is added to a session, so the kit calls this again inside the
     /// session's begin/commitConfiguration right after adding the input.
-    func reapplyVideoPreference() {
-        guard hasVideo, let preference = configuration.videoPreference else { return }
-        apply(preference)
+    ///
+    /// A multi-camera session accepts only formats with `isMultiCamSupported`
+    /// and has no `.high` preset to fall back on, so it always gets a
+    /// preference — the configured one, or 1080p30.
+    func reapplyVideoPreference(multiCamera: Bool) {
+        guard hasVideo else { return }
+        if multiCamera {
+            apply(configuration.videoPreference ?? .hd1080p30, requireMultiCamSupport: true)
+        } else if let preference = configuration.videoPreference {
+            apply(preference)
+        }
     }
 
-    private func apply(_ preference: EnhancedCaptureVideoPreference) {
+    private func apply(_ preference: EnhancedCaptureVideoPreference, requireMultiCamSupport: Bool = false) {
         do {
-            if try device.applyVideoPreference(preference) == nil {
-                mlog.warning("No video formats reported by \(self.device.localizedName); keeping default format")
+            if try device.applyVideoPreference(preference, requireMultiCamSupport: requireMultiCamSupport) == nil {
+                mlog.warning("No usable video format on \(self.device.localizedName) (multi-camera: \(requireMultiCamSupport)); keeping default format")
             }
         } catch {
             mlog.error("Failed to configure device format: \(error.localizedDescription)")
@@ -414,6 +425,30 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         videoRotationAngle = angle
         delegate?.deviceVideoRotationAngleDidChange(angle, uniqueID: device.uniqueID)
     }
+
+    // MARK: - System pressure (iOS / iPadOS)
+
+    /// Cameras report thermal / power pressure per device. Serious and above
+    /// means AVFoundation is about to throttle or stop the camera — which, in a
+    /// multi-camera session, is the common failure mode.
+    private func setupSystemPressureObserver() {
+        guard hasVideo, device.position != .unspecified else { return }
+        systemPressureObservation = device.observe(\.systemPressureState, options: [.new]) { [weak self] device, _ in
+            guard let self else { return }
+            let state = device.systemPressureState
+            let level: String
+            switch state.level {
+            case .nominal:  level = "nominal"
+            case .fair:     level = "fair"
+            case .serious:  level = "serious"
+            case .critical: level = "critical"
+            case .shutdown: level = "shutdown"
+            default:        level = "unknown"
+            }
+            let elevated = state.level == .serious || state.level == .critical || state.level == .shutdown
+            self.delegate?.deviceSystemPressureDidChange(level: level, isElevated: elevated, uniqueID: self.device.uniqueID)
+        }
+    }
     #endif
 
     // MARK: - Device controls
@@ -482,6 +517,8 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         #if os(iOS)
         rotationObservation?.invalidate()
         rotationObservation = nil
+        systemPressureObservation?.invalidate()
+        systemPressureObservation = nil
         #endif
     }
 

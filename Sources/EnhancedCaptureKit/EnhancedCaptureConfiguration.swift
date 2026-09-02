@@ -182,6 +182,18 @@ public struct EnhancedCaptureConfiguration: Sendable, Equatable {
     /// Restart the session automatically after `AVError.mediaServicesWereReset`.
     public var restartsAfterMediaServicesReset: Bool = true
 
+    /// iOS / iPadOS: run an `AVCaptureMultiCamSession` so more than one built-in
+    /// camera (front + back) can be enabled at once. Applied only when
+    /// `AVCaptureMultiCamSession.isMultiCamSupported` is true (iPad Pro 2018
+    /// and later, iPhone XS and later); otherwise the kit reports
+    /// `EnhancedCaptureError.multiCameraUnsupported` and uses a single-camera
+    /// session. A multi-camera session always honours device formats
+    /// (`.inputPriority`): every camera gets `videoPreference`, or
+    /// ``EnhancedCaptureVideoPreference/hd1080p30`` when that is `nil`, limited
+    /// to formats that support multi-camera. Each added camera is checked
+    /// against the hardware budget and removed again if it exceeds it.
+    public var multiCameraEnabled: Bool = false
+
     public init() {}
 
     /// Everything off except video and the macOS speaker preview — identical to

@@ -94,15 +94,34 @@ public extension EnhancedCaptureDelegate {
 /// snapshot rebuilt on each emit. Session plumbing stays on `sessionQueue`.
 /// `@unchecked Sendable` reflects this manual confinement, not an absence of
 /// shared state.
+///
+/// ── Session ownership ─────────────────────────────────────────────────
+/// The kit *owns* its `AVCaptureSession` (``session``) rather than being one,
+/// so the concrete class can be chosen at construction: an
+/// `AVCaptureMultiCamSession` on iPads / iPhones that support it when
+/// `configuration.multiCameraEnabled` is set, a plain `AVCaptureSession`
+/// otherwise. Consumers that need the session (preview layers, KVO) read it
+/// from ``session``.
 @available(macOS 10.15, iOS 16.0, *)
-public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
+public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
 
     // MARK: - Properties
 
     public weak var delegate: EnhancedCaptureDelegate?
 
     /// Options fixed at construction. See ``EnhancedCaptureConfiguration``.
-    public private(set) var configuration: EnhancedCaptureConfiguration = .default
+    public let configuration: EnhancedCaptureConfiguration
+
+    /// The capture session the kit drives. An `AVCaptureMultiCamSession` when
+    /// ``isMultiCameraSession`` is true. Mutate it only through the kit.
+    public let session: AVCaptureSession
+
+    /// `true` when ``session`` is an `AVCaptureMultiCamSession` and several
+    /// built-in cameras can be enabled at once.
+    public let isMultiCameraSession: Bool
+
+    /// Whether the session is currently running.
+    public var isRunning: Bool { session.isRunning }
 
     // Internal for access from extension files (EnhancedCaptureObservers.swift)
     var observers: [NSObjectProtocol] = []
@@ -138,10 +157,13 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         self.init(delegate: delegate, configuration: .default)
     }
 
-    public convenience init(delegate: EnhancedCaptureDelegate, configuration: EnhancedCaptureConfiguration) {
-        self.init()
-        self.delegate = delegate
+    public init(delegate: EnhancedCaptureDelegate, configuration: EnhancedCaptureConfiguration) {
         self.configuration = configuration
+        let (session, isMultiCam, multiCamRefused) = Self.makeSession(for: configuration)
+        self.session = session
+        self.isMultiCameraSession = isMultiCam
+        super.init()
+        self.delegate = delegate
 
         #if os(iOS)
         if #unavailable(iOS 17.0) {
@@ -155,7 +177,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
         #endif
 
-        mlog.debug("Initializing with delegate (audio: \(configuration.audioEnabled))")
+        mlog.debug("Initializing with delegate (audio: \(configuration.audioEnabled), multi-camera: \(isMultiCam))")
 
         setupCaptureKit()
 
@@ -166,6 +188,9 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         // instance is still evaluating.
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if multiCamRefused {
+                self.report(.multiCameraUnsupported, for: nil)
+            }
             // Check permissions — session start is deferred until camera is authorized
             self.permissionManager = PermissionManager(delegate: self)
             self.permissionManager?.checkPermissions(includeMicrophone: self.configuration.audioEnabled)
@@ -178,6 +203,23 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
 
         mlog.debug("Initialization pending permission resolution")
+    }
+
+    /// Picks the session class. Multi-camera is iOS-only and needs hardware
+    /// support; the third value says the request had to be refused.
+    private static func makeSession(for configuration: EnhancedCaptureConfiguration) -> (AVCaptureSession, Bool, Bool) {
+        #if os(iOS)
+        if configuration.multiCameraEnabled {
+            if AVCaptureMultiCamSession.isMultiCamSupported {
+                return (AVCaptureMultiCamSession(), true, false)
+            }
+            mlog.notice("Multi-camera requested but unsupported on this device — single-camera session")
+            return (AVCaptureSession(), false, true)
+        }
+        return (AVCaptureSession(), false, false)
+        #else
+        return (AVCaptureSession(), false, configuration.multiCameraEnabled)
+        #endif
     }
 
     // MARK: - CaptureKit Setup
@@ -201,19 +243,19 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             #if os(iOS) || os(tvOS)
             switch config.audioSessionPolicy {
             case .automatic:
-                self.usesApplicationAudioSession = true
-                self.automaticallyConfiguresApplicationAudioSession = true
+                self.session.usesApplicationAudioSession = true
+                self.session.automaticallyConfiguresApplicationAudioSession = true
             case .applicationManaged:
-                self.usesApplicationAudioSession = true
-                self.automaticallyConfiguresApplicationAudioSession = false
+                self.session.usesApplicationAudioSession = true
+                self.session.automaticallyConfiguresApplicationAudioSession = false
             case .detached:
-                self.usesApplicationAudioSession = false
+                self.session.usesApplicationAudioSession = false
             }
             #endif
             #if os(iOS)
             if config.multitaskingCameraAccessEnabled {
-                if self.isMultitaskingCameraAccessSupported {
-                    self.isMultitaskingCameraAccessEnabled = true
+                if self.session.isMultitaskingCameraAccessSupported {
+                    self.session.isMultitaskingCameraAccessEnabled = true
                     mlog.info("Multitasking camera access enabled")
                 } else {
                     mlog.debug("Multitasking camera access unsupported (needs entitlement or voip background mode)")
@@ -385,14 +427,14 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     /// starts a source deferred at enable time.
     @MainActor
     private func addDeviceToSession(_ captureDevice: EnhancedCaptureDevice, includeAudio: Bool, source: EnhancedCaptureSource) {
-        addToSession(captureDevice: captureDevice, includeAudio: includeAudio) { [weak self] success in
+        addToSession(captureDevice: captureDevice, includeAudio: includeAudio) { [weak self] error in
             guard let self else { return }
             self.runOnMainActor { kit in
                 guard kit.enabledSources.contains(source.id) else { return }
-                if success {
-                    kit.setState(.capturing, for: source)
+                if let error {
+                    kit.fail(source, with: error)
                 } else {
-                    kit.fail(source, with: .captureStartFailed(reason: "could not add device to session"))
+                    kit.setState(.capturing, for: source)
                 }
             }
         }
@@ -407,12 +449,12 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             guard let device = trackedDevice(for: source) else { continue }
             sessionQueue.async { [weak self] in
                 guard let self else { return }
-                let inputInSession = device.input.map { self.inputs.contains($0) } ?? false
+                let inputInSession = device.input.map { self.session.inputs.contains($0) } ?? false
                 if inputInSession {
                     // Video is already flowing; just add the audio leg.
-                    self.beginConfiguration()
+                    self.session.beginConfiguration()
                     let attached = self.attach(device.dataAudioOutput, device.audioConnection, label: "audio data")
-                    self.commitConfiguration()
+                    self.session.commitConfiguration()
                     if attached { mlog.info("Attached audio to \(source.displayName) after microphone grant") }
                 } else {
                     // A microphone-only source held back at enable time.
@@ -465,17 +507,43 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
 
     // MARK: - Session Management
 
-    private func addToSession(captureDevice: EnhancedCaptureDevice, includeAudio: Bool, completion: @escaping @Sendable (Bool) -> Void) {
+    /// Adds the device on the session queue. `completion` receives `nil` on
+    /// success or the error that left the session unchanged.
+    private func addToSession(captureDevice: EnhancedCaptureDevice, includeAudio: Bool, completion: @escaping @Sendable (EnhancedCaptureError?) -> Void) {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
 
-            self.beginConfiguration()
+            self.session.beginConfiguration()
             let added = self.attachDevice(captureDevice, includeAudio: includeAudio)
             // Commit before reporting, so `.capturing` never reaches the
             // consumer while the (possibly lengthy) pipeline reconfiguration
             // is still in progress.
-            self.commitConfiguration()
-            completion(added)
+            self.session.commitConfiguration()
+
+            guard added else {
+                completion(.captureStartFailed(reason: "could not add device to session"))
+                return
+            }
+
+            #if os(iOS)
+            // A multi-camera session computes its hardware budget on commit.
+            // Over budget it would run briefly and then be interrupted, so take
+            // the camera back out and tell the consumer why.
+            if let multiCam = self.session as? AVCaptureMultiCamSession {
+                let hardware = multiCam.hardwareCost
+                let pressure = multiCam.systemPressureCost
+                mlog.info("Multi-camera cost after adding \(captureDevice.device.localizedName): hardware \(hardware), system pressure \(pressure)")
+                if hardware > 1.0 || pressure > 1.0 {
+                    multiCam.beginConfiguration()
+                    self.detachDevice(captureDevice)
+                    multiCam.commitConfiguration()
+                    completion(.multiCameraHardwareCostExceeded(hardwareCost: hardware, systemPressureCost: pressure))
+                    return
+                }
+            }
+            #endif
+
+            completion(nil)
         }
     }
 
@@ -483,18 +551,19 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     /// every output the device prepared. On total failure the session is left
     /// exactly as it was found.
     private func attachDevice(_ captureDevice: EnhancedCaptureDevice, includeAudio: Bool) -> Bool {
-        guard let input = captureDevice.input, self.canAddInput(input) else {
+        guard let input = captureDevice.input, session.canAddInput(input) else {
             mlog.error("Failed to add input for device")
             return false
         }
 
         // Add input WITHOUT automatic connections
-        self.addInputWithNoConnections(input)
+        session.addInputWithNoConnections(input)
 
         // iOS / tvOS reset the device format when the input joins; put the
-        // preference back while still inside begin/commitConfiguration.
+        // preference back while still inside begin/commitConfiguration. A
+        // multi-camera session additionally needs a multi-cam-capable format.
         #if os(iOS) || os(tvOS)
-        captureDevice.reapplyVideoPreference()
+        captureDevice.reapplyVideoPreference(multiCamera: isMultiCameraSession)
         #endif
 
         var addedAnything = attach(captureDevice.dataVideoOutput, captureDevice.videoConnection, label: "video")
@@ -510,7 +579,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         if !addedAnything {
             // Nothing usable — each failed `attach` already undid its output;
             // don't leave a dangling input either.
-            self.removeInput(input)
+            session.removeInput(input)
             return false
         }
 
@@ -527,23 +596,23 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     private func attach(_ output: AVCaptureOutput?, _ connection: AVCaptureConnection?, label: String) -> Bool {
         guard let output, let connection else { return false }
 
-        let outputWasPresent = self.outputs.contains(output)
+        let outputWasPresent = session.outputs.contains(output)
         if outputWasPresent {
-            if self.connections.contains(connection) { return true }
+            if session.connections.contains(connection) { return true }
         } else {
-            guard self.canAddOutput(output) else {
+            guard session.canAddOutput(output) else {
                 mlog.error("Failed to add \(label) output")
                 return false
             }
-            self.addOutputWithNoConnections(output)
+            session.addOutputWithNoConnections(output)
         }
 
-        guard self.canAddConnection(connection) else {
+        guard session.canAddConnection(connection) else {
             mlog.error("Failed to add \(label) connection")
-            if !outputWasPresent { self.removeOutput(output) }
+            if !outputWasPresent { session.removeOutput(output) }
             return false
         }
-        self.addConnection(connection)
+        session.addConnection(connection)
         mlog.debug("Added \(label) connection")
         return true
     }
@@ -552,44 +621,46 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
 
-            self.beginConfiguration()
-            defer {
-                self.commitConfiguration()
-                DispatchQueue.main.async {
-                    completion()
-                }
+            self.session.beginConfiguration()
+            self.detachDevice(captureDevice)
+            self.session.commitConfiguration()
+            DispatchQueue.main.async {
+                completion()
             }
-
-            var connections: [(AVCaptureConnection?, String)] = [
-                (captureDevice.videoConnection, "video"),
-                (captureDevice.audioConnection, "audio data"),
-            ]
-            var outputs: [(AVCaptureOutput?, String)] = [
-                (captureDevice.dataVideoOutput, "video"),
-                (captureDevice.dataAudioOutput, "audio data"),
-            ]
-            #if os(macOS)
-            connections.append((captureDevice.audioPreviewConnection, "audio preview"))
-            outputs.append((captureDevice.audioPreview, "audio preview"))
-            #endif
-
-            // Remove only what is still in the session — AVFoundation may have
-            // auto-removed an unplugged device already.
-            for case (let connection?, let label) in connections where self.connections.contains(connection) {
-                self.removeConnection(connection)
-                mlog.debug("Removed \(label) connection")
-            }
-            for case (let output?, let label) in outputs where self.outputs.contains(output) {
-                self.removeOutput(output)
-                mlog.debug("Removed \(label) output")
-            }
-            if let input = captureDevice.input, self.inputs.contains(input) {
-                self.removeInput(input)
-                mlog.debug("Removed input")
-            }
-
-            mlog.debug("Successfully removed device from session")
         }
+    }
+
+    /// Session-queue only, inside begin/commitConfiguration. Removes only what
+    /// is still in the session — AVFoundation may have auto-removed an
+    /// unplugged device already.
+    private func detachDevice(_ captureDevice: EnhancedCaptureDevice) {
+        var connections: [(AVCaptureConnection?, String)] = [
+            (captureDevice.videoConnection, "video"),
+            (captureDevice.audioConnection, "audio data"),
+        ]
+        var outputs: [(AVCaptureOutput?, String)] = [
+            (captureDevice.dataVideoOutput, "video"),
+            (captureDevice.dataAudioOutput, "audio data"),
+        ]
+        #if os(macOS)
+        connections.append((captureDevice.audioPreviewConnection, "audio preview"))
+        outputs.append((captureDevice.audioPreview, "audio preview"))
+        #endif
+
+        for case (let connection?, let label) in connections where session.connections.contains(connection) {
+            session.removeConnection(connection)
+            mlog.debug("Removed \(label) connection")
+        }
+        for case (let output?, let label) in outputs where session.outputs.contains(output) {
+            session.removeOutput(output)
+            mlog.debug("Removed \(label) output")
+        }
+        if let input = captureDevice.input, session.inputs.contains(input) {
+            session.removeInput(input)
+            mlog.debug("Removed input")
+        }
+
+        mlog.debug("Successfully removed device from session")
     }
 
     /// Starts the session on the session queue if it is not already running.
@@ -597,8 +668,8 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     /// still needs a running session.
     private func startSessionIfNeeded() {
         sessionQueue.async { [weak self] in
-            guard let self, !self.isRunning else { return }
-            self.startRunning()
+            guard let self, !self.session.isRunning else { return }
+            self.session.startRunning()
             mlog.info("Session started running")
         }
     }
@@ -608,8 +679,8 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     public func restartSession() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            if self.isRunning { self.stopRunning() }
-            self.startRunning()
+            if self.session.isRunning { self.session.stopRunning() }
+            self.session.startRunning()
             mlog.notice("Session restarted")
         }
     }
@@ -1115,6 +1186,16 @@ public extension EnhancedCaptureKit {
     /// Whether Center Stage is currently on.
     static var isCenterStageEnabled: Bool { AVCaptureDevice.isCenterStageEnabled }
 
+    /// Whether this device can run several built-in cameras at once
+    /// (`AVCaptureMultiCamSession.isMultiCamSupported`). Always `false` on macOS.
+    static var isMultiCameraSupported: Bool {
+        #if os(iOS)
+        return AVCaptureMultiCamSession.isMultiCamSupported
+        #else
+        return false
+        #endif
+    }
+
     #if os(iOS) || os(tvOS)
     /// Audio inputs the shared `AVAudioSession` can route from (built-in mic,
     /// USB-C interface, Bluetooth headset). The kit's single microphone
@@ -1209,6 +1290,16 @@ extension EnhancedCaptureKit: EnhancedCaptureDeviceDelegate {
         }
     }
 
+    func deviceSystemPressureDidChange(level: String, isElevated: Bool, uniqueID: String) {
+        let source = routedSource(for: uniqueID)
+        let message = "System pressure \(level) on \(source?.displayName ?? uniqueID)"
+        if isElevated { mlog.error(message) } else { mlog.info(message) }
+        guard isElevated else { return }
+        runOnMainActor { kit in
+            kit.report(.systemPressureElevated(level: level), for: source)
+        }
+    }
+
     func devicePreviewLayer(previewLayer: AVCaptureVideoPreviewLayer, model: String) {
         mlog.debug("Preview layer received for model: \(model)")
     }
@@ -1226,19 +1317,24 @@ extension EnhancedCaptureKit: PermissionManagerDelegate {
             if status == .authorized {
                 // Camera authorized — start the capture session
                 let usesInputPriority = configuration.videoPreference != nil
+                let isMultiCam = isMultiCameraSession
                 sessionQueue.async { [weak self] in
                     guard let self = self else { return }
                     // iOS / tvOS: `.high` lets AVFoundation pick each device's
                     // format; `.inputPriority` honours the activeFormat chosen
-                    // from `configuration.videoPreference`. macOS has no such
-                    // preset — an explicitly set activeFormat is honoured under `.high`.
-                    #if os(iOS) || os(tvOS)
-                    self.sessionPreset = usesInputPriority ? .inputPriority : .high
-                    #else
-                    self.sessionPreset = .high
-                    #endif
-                    self.startRunning()
-                    mlog.info("Session started running (camera authorized, inputPriority: \(usesInputPriority))")
+                    // from `configuration.videoPreference`. A multi-camera
+                    // session is always `.inputPriority` and rejects any other
+                    // preset. macOS has no such preset — an explicitly set
+                    // activeFormat is honoured under `.high`.
+                    if !isMultiCam {
+                        #if os(iOS) || os(tvOS)
+                        self.session.sessionPreset = usesInputPriority ? .inputPriority : .high
+                        #else
+                        self.session.sessionPreset = .high
+                        #endif
+                    }
+                    self.session.startRunning()
+                    mlog.info("Session started running (camera authorized, inputPriority: \(usesInputPriority || isMultiCam), multi-camera: \(isMultiCam))")
 
                     DispatchQueue.main.async {
                         self.delegate?.enhancedCaptureDidInitialize(self)

@@ -163,6 +163,20 @@ public enum EnhancedCaptureError: Error, Sendable, CustomStringConvertible {
     /// (media services reset); otherwise the consumer decides.
     case sessionRuntimeError(reason: String, willRestart: Bool)
 
+    /// `multiCameraEnabled` was requested but this device (or platform) has no
+    /// `AVCaptureMultiCamSession` support; the kit fell back to a single-camera session.
+    case multiCameraUnsupported
+
+    /// Adding a camera pushed the multi-camera session past what the hardware
+    /// can run (`hardwareCost` / `systemPressureCost` above 1.0). The camera
+    /// was removed again; lower `videoPreference` (resolution or frame rate)
+    /// on the other cameras and retry.
+    case multiCameraHardwareCostExceeded(hardwareCost: Float, systemPressureCost: Float)
+
+    /// iOS: a camera reported serious or critical system pressure (thermal,
+    /// peak power). Frame rate drops or capture stops if it persists.
+    case systemPressureElevated(level: String)
+
     public var description: String {
         switch self {
         case .permissionDenied(let type):
@@ -179,6 +193,12 @@ public enum EnhancedCaptureError: Error, Sendable, CustomStringConvertible {
             return "Device configuration failed: \(reason)"
         case .sessionRuntimeError(let reason, let willRestart):
             return "Session runtime error: \(reason)\(willRestart ? " (restarting)" : "")"
+        case .multiCameraUnsupported:
+            return "Multi-camera capture is not supported on this device; using a single-camera session"
+        case .multiCameraHardwareCostExceeded(let hardwareCost, let systemPressureCost):
+            return "Multi-camera hardware budget exceeded (hardware \(hardwareCost), system pressure \(systemPressureCost)); camera removed"
+        case .systemPressureElevated(let level):
+            return "System pressure \(level)"
         }
     }
 }

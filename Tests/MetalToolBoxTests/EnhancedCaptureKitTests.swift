@@ -204,3 +204,62 @@ final class EnhancedCaptureTypesTests: XCTestCase {
     }
     #endif
 }
+
+final class EnhancedCaptureMultiCameraTests: XCTestCase {
+
+    private func candidate(_ w: Int32, _ h: Int32, fps: Double, multiCam: Bool) -> EnhancedCaptureFormatCandidate {
+        EnhancedCaptureFormatCandidate(width: w, height: h, frameRateRanges: [1...fps], isMultiCamSupported: multiCam)
+    }
+
+    /// A back camera as seen on an iPad Pro: the large / fast formats are not
+    /// multi-cam capable, the 720p and 1080p30 ones are.
+    private var formats: [EnhancedCaptureFormatCandidate] {
+        [
+            candidate(1280, 720, fps: 60, multiCam: true),
+            candidate(1920, 1080, fps: 30, multiCam: true),
+            candidate(1920, 1080, fps: 60, multiCam: false),
+            candidate(3840, 2160, fps: 30, multiCam: false),
+            candidate(4032, 3024, fps: 30, multiCam: false),
+        ]
+    }
+
+    func testSingleCameraIgnoresMultiCamFlag() {
+        let index = EnhancedCaptureFormatSelector.bestIndex(among: formats, preference: .uhd4K30)
+        XCTAssertEqual(index, 3, "a plain session may use the 4K format")
+    }
+
+    func testMultiCameraRestrictsToSupportedFormats() {
+        let index = EnhancedCaptureFormatSelector.bestIndex(among: formats, preference: .uhd4K30, requireMultiCamSupport: true)
+        XCTAssertEqual(index, 1, "4K is unavailable; the largest multi-cam format wins")
+    }
+
+    func testMultiCameraNeverPicksAnUnsupportedFormat() {
+        // 1080p60 exists but is not multi-cam capable. Frame rate is filtered
+        // before size (rule 1), so the 60 fps request lands on 720p60 — never
+        // on the unsupported 1080p60 at index 2.
+        let index = EnhancedCaptureFormatSelector.bestIndex(among: formats, preference: .hd1080p60, requireMultiCamSupport: true)
+        XCTAssertEqual(index, 0)
+        XCTAssertTrue(formats[index!].isMultiCamSupported)
+    }
+
+    func testMultiCameraWithNoSupportedFormatYieldsNil() {
+        let unsupported = formats.filter { !$0.isMultiCamSupported }
+        XCTAssertNil(EnhancedCaptureFormatSelector.bestIndex(among: unsupported, preference: .hd1080p30, requireMultiCamSupport: true))
+        XCTAssertNotNil(EnhancedCaptureFormatSelector.bestIndex(among: unsupported, preference: .hd1080p30))
+    }
+
+    func testMultiCameraIsOffByDefault() {
+        XCTAssertFalse(EnhancedCaptureConfiguration.default.multiCameraEnabled)
+        #if os(macOS)
+        XCTAssertFalse(EnhancedCaptureKit.isMultiCameraSupported, "macOS has no AVCaptureMultiCamSession")
+        #endif
+    }
+
+    func testMultiCameraErrorsDescribeThemselves() {
+        XCTAssertTrue(EnhancedCaptureError.multiCameraUnsupported.description.contains("single-camera"))
+        let cost = EnhancedCaptureError.multiCameraHardwareCostExceeded(hardwareCost: 1.4, systemPressureCost: 0.6)
+        XCTAssertTrue(cost.description.contains("1.4"))
+        XCTAssertTrue(cost.description.contains("0.6"))
+        XCTAssertTrue(EnhancedCaptureError.systemPressureElevated(level: "critical").description.contains("critical"))
+    }
+}
