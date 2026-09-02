@@ -5,8 +5,6 @@
 //  Created by Dustin Nielson on 2/27/26.
 //
 
-
-
 import Foundation
 import AVFoundation
 import CoreMedia
@@ -21,33 +19,78 @@ import CoreMediaIO
 #endif
 
 
-// MARK: - CaptureManagerDelegate Protocol
+// MARK: - EnhancedCaptureDelegate Protocol
 
 public protocol EnhancedCaptureDelegate: AnyObject {
+    /// Discovery and permission resolution finished; the session is running
+    /// when camera access was granted. Always delivered on the main thread,
+    /// always after `init` returned.
     func enhancedCaptureDidInitialize(_ manager: EnhancedCaptureKit)
+
+    /// Video from a display (macOS) or from an external device. Delivered on
+    /// the source's capture queue at frame rate.
     func enhancedCaptureScreenDidOutputSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource)
-    func captureSourceListDidChange(_ manager:EnhancedCaptureKit, sources: [EnhancedCaptureSource])
+
+    /// The set of sources the consumer may enable changed. Main thread.
+    func captureSourceListDidChange(_ manager: EnhancedCaptureKit, sources: [EnhancedCaptureSource])
+
+    /// Video from an iOS device connected over USB (macOS). Capture queue.
     func enhancedCaptureDeviceDidOutputSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource)
+
+    /// A permission the kit needs was resolved. Main thread.
     func enhancedCapture(_ manager: EnhancedCaptureKit, permissionStatusDidChange type: PermissionType, status: PermissionStatus)
+
+    /// Audio from a microphone, a muxed device (HDMI capture card), or a
+    /// display with system audio. Requires `configuration.audioEnabled`.
+    /// Delivered on the source's audio queue; the buffer is PCM in the
+    /// device's native format (read it via `CMSampleBufferGetFormatDescription`).
+    func enhancedCaptureDidOutputAudioSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource)
+
+    /// Per-channel peak / average levels for an audio-capable source.
+    /// Requires `configuration.audioLevelMeteringEnabled`. Audio queue.
+    func enhancedCapture(_ manager: EnhancedCaptureKit, didUpdateAudioLevel level: EnhancedCaptureAudioLevel, for source: EnhancedCaptureSource)
+
+    /// An enabled source started, stopped, was interrupted, or failed. Main thread.
+    func enhancedCapture(_ manager: EnhancedCaptureKit, sourceStateDidChange state: EnhancedCaptureSourceState, for source: EnhancedCaptureSource)
+
+    /// iOS / iPadOS: the whole session was interrupted or resumed (background,
+    /// Split View without multitasking access, another app took the camera,
+    /// thermal pressure). Main thread.
+    func enhancedCapture(_ manager: EnhancedCaptureKit, sessionInterruptionDidChange interruption: EnhancedCaptureSessionInterruption)
+
+    /// Something failed that used to be a log line only. `source` is `nil`
+    /// for session-wide problems. Main thread.
+    func enhancedCapture(_ manager: EnhancedCaptureKit, didEncounterError error: EnhancedCaptureError, for source: EnhancedCaptureSource?)
+
+    /// iOS / iPadOS: the rotation applied to a built-in camera's frames
+    /// changed (0, 90, 180, 270 degrees). Main thread.
+    func enhancedCapture(_ manager: EnhancedCaptureKit, videoRotationAngleDidChange angle: CGFloat, for source: EnhancedCaptureSource)
 }
 
 public extension EnhancedCaptureDelegate {
     func enhancedCaptureDeviceDidOutputSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource) {}
     func enhancedCapture(_ manager: EnhancedCaptureKit, permissionStatusDidChange type: PermissionType, status: PermissionStatus) {}
+    func enhancedCaptureDidOutputAudioSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource) {}
+    func enhancedCapture(_ manager: EnhancedCaptureKit, didUpdateAudioLevel level: EnhancedCaptureAudioLevel, for source: EnhancedCaptureSource) {}
+    func enhancedCapture(_ manager: EnhancedCaptureKit, sourceStateDidChange state: EnhancedCaptureSourceState, for source: EnhancedCaptureSource) {}
+    func enhancedCapture(_ manager: EnhancedCaptureKit, sessionInterruptionDidChange interruption: EnhancedCaptureSessionInterruption) {}
+    func enhancedCapture(_ manager: EnhancedCaptureKit, didEncounterError error: EnhancedCaptureError, for source: EnhancedCaptureSource?) {}
+    func enhancedCapture(_ manager: EnhancedCaptureKit, videoRotationAngleDidChange angle: CGFloat, for source: EnhancedCaptureSource) {}
 }
 
 /// ── Threading contract ────────────────────────────────────────────────
 /// Discovery state (`captureScreens` / `captureDevices` / `captureSources` /
-/// `enabledSources`) is MAIN-ACTOR confined: every mutation path — init-time
-/// discovery, screen/device observers, lost-device completions, and the
-/// public enable/disable API — funnels onto the main actor, and the
-/// `captureSourceListDidChange` / `enhancedCaptureDidInitialize` delegate
-/// callbacks are always delivered there, always AFTER `init(delegate:)` has
-/// returned (a callback during init reaches a consumer whose stored
-/// reference is still nil). The sample-buffer hot path never touches those
-/// arrays: it routes through a lock-guarded snapshot rebuilt on each emit.
-/// Session plumbing stays on `sessionQueue`. `@unchecked Sendable` reflects
-/// this manual confinement, not an absence of shared state.
+/// `enabledSources` / `sourceStates`) is MAIN-ACTOR confined: every mutation
+/// path — init-time discovery, screen/device observers, lost-device
+/// completions, and the public enable/disable API — funnels onto the main
+/// actor, and the `captureSourceListDidChange` / `enhancedCaptureDidInitialize`
+/// / state / error delegate callbacks are always delivered there, always AFTER
+/// `init(delegate:)` has returned (a callback during init reaches a consumer
+/// whose stored reference is still nil). The sample-buffer hot paths (video
+/// and audio) never touch those arrays: they route through a lock-guarded
+/// snapshot rebuilt on each emit. Session plumbing stays on `sessionQueue`.
+/// `@unchecked Sendable` reflects this manual confinement, not an absence of
+/// shared state.
 @available(macOS 10.15, iOS 16.0, *)
 public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
 
@@ -55,7 +98,10 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
 
     public weak var delegate: EnhancedCaptureDelegate?
 
-    // Internal for access from extension files (CaptureObservers.swift)
+    /// Options fixed at construction. See ``EnhancedCaptureConfiguration``.
+    public private(set) var configuration: EnhancedCaptureConfiguration = .default
+
+    // Internal for access from extension files (EnhancedCaptureObservers.swift)
     var observers: [NSObjectProtocol] = []
 
     // MARK: - MacOS only ScreenCaptureKit
@@ -69,18 +115,31 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     // Track which sources are currently enabled/capturing
     private var enabledSources: Set<String> = []
 
-    // Hot-path routing snapshot: deviceVideoBuffer() runs on capture callback
+    // Last state reported per source id (main actor).
+    private var sourceStates: [String: EnhancedCaptureSourceState] = [:]
+
+    // Microphone access, resolved through PermissionManager (main actor).
+    private var microphoneStatus: PermissionStatus = .notDetermined
+
+    // Hot-path routing snapshot: the sample-buffer callbacks run on capture
     // queues at frame rate and must not scan `captureDevices` while the main
     // actor mutates it. Rebuilt under the lock on every emit.
     private let routingLock = NSLock()
     private var routingByDeviceUniqueID: [String: EnhancedCaptureSource] = [:]
 
-    private let sessionQueue = DispatchQueue(label: "com.mvs.captureManager.sessionQueue", qos: .userInteractive)
+    private let sessionQueue = DispatchQueue(label: "com.xocialize.MetalToolBox.EnhancedCaptureKit.session", qos: .userInteractive)
     private var permissionManager: PermissionManager?
 
+    // MARK: - Init
+
     public convenience init(delegate: EnhancedCaptureDelegate) {
+        self.init(delegate: delegate, configuration: .default)
+    }
+
+    public convenience init(delegate: EnhancedCaptureDelegate, configuration: EnhancedCaptureConfiguration) {
         self.init()
         self.delegate = delegate
+        self.configuration = configuration
 
         #if os(iOS)
         if #unavailable(iOS 17.0) {
@@ -94,7 +153,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
         #endif
 
-        mlog.debug("Initializing with delegate")
+        mlog.debug("Initializing with delegate (audio: \(configuration.audioEnabled))")
 
         setupCaptureKit()
 
@@ -107,7 +166,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             guard let self else { return }
             // Check permissions — session start is deferred until camera is authorized
             self.permissionManager = PermissionManager(delegate: self)
-            self.permissionManager?.checkPermissions()
+            self.permissionManager?.checkPermissions(includeMicrophone: self.configuration.audioEnabled)
             // Device discovery (populates device list so sources are ready
             // when the session starts)
             self.refreshDevices()
@@ -126,9 +185,40 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         enableIOSDevices()
         #endif
         enableObservers()
+        configureSessionForPlatform()
         // Note: first screens pass + refreshDevices() run from init's deferred
         // main-actor task — never synchronously inside init.
         mlog.debug("Capture components setup complete")
+    }
+
+    /// Session-wide options that must be set before `startRunning()`.
+    private func configureSessionForPlatform() {
+        let config = configuration
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            #if os(iOS) || os(tvOS)
+            switch config.audioSessionPolicy {
+            case .automatic:
+                self.usesApplicationAudioSession = true
+                self.automaticallyConfiguresApplicationAudioSession = true
+            case .applicationManaged:
+                self.usesApplicationAudioSession = true
+                self.automaticallyConfiguresApplicationAudioSession = false
+            case .detached:
+                self.usesApplicationAudioSession = false
+            }
+            #endif
+            #if os(iOS)
+            if config.multitaskingCameraAccessEnabled {
+                if self.isMultitaskingCameraAccessSupported {
+                    self.isMultitaskingCameraAccessEnabled = true
+                    mlog.info("Multitasking camera access enabled")
+                } else {
+                    mlog.debug("Multitasking camera access unsupported (needs entitlement or voip background mode)")
+                }
+            }
+            #endif
+        }
     }
 
     // MARK: - Main-actor funnel
@@ -145,7 +235,27 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             Task { @MainActor in body(self) }
         }
     }
-    
+
+    // MARK: - State / error reporting (main actor)
+
+    @MainActor
+    private func setState(_ state: EnhancedCaptureSourceState, for source: EnhancedCaptureSource) {
+        sourceStates[source.id] = state
+        delegate?.enhancedCapture(self, sourceStateDidChange: state, for: source)
+    }
+
+    @MainActor
+    private func report(_ error: EnhancedCaptureError, for source: EnhancedCaptureSource?) {
+        mlog.error("\(error.description)\(source.map { " [\($0.displayName)]" } ?? "")")
+        delegate?.enhancedCapture(self, didEncounterError: error, for: source)
+    }
+
+    /// The last state reported for a source, or `.idle` if it was never enabled.
+    @MainActor
+    public func state(for source: EnhancedCaptureSource) -> EnhancedCaptureSourceState {
+        sourceStates[source.id] ?? .idle
+    }
+
     // MARK: - Capture enable/disable
 
     // Public wrappers keep the pre-confinement signatures (callable from any
@@ -157,7 +267,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     }
 
     public func disableCapture(for source: EnhancedCaptureSource) {
-        runOnMainActor { $0.disableCaptureIsolated(for: source) }
+        runOnMainActor { $0.disableCaptureIsolated(for: source, completion: nil) }
     }
 
     /// Disables capture for the given source with a completion callback.
@@ -180,7 +290,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         enabledSources.insert(source.id)
 
         mlog.info("Enabling capture for source: \(source.displayName) (type: \(String(describing: source.type)))")
-        
+
         switch source.type {
         case .screen, .screenMain:
             #if os(macOS)
@@ -188,36 +298,63 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             guard let captureScreen = captureScreens.first(where: {
                 $0.captureSource?.id == source.id
             }) else {
-                mlog.error("Could not find screen capture for source: \(source.id)")
                 enabledSources.remove(source.id)
+                report(.sourceUnavailable(source.id), for: source)
                 return
             }
 
-            // Start the screen capture
+            // Start the screen capture (state arrives via EnhancedCaptureScreenDelegate)
             captureScreen.startCapture()
             mlog.info("Started screen capture for: \(source.displayName)")
             #else
-            mlog.debug("Screen capture not available on this platform")
             enabledSources.remove(source.id)
+            report(.platformUnsupported(feature: "screen capture"), for: source)
             #endif
 
-        case .externalDevice, .iOSDevice, .cameraFront, .cameraBack:
+        case .externalDevice, .iOSDevice, .cameraFront, .cameraBack, .microphone:
             // Find the device in our devices array
             guard let captureDevice = captureDevices.first(where: {
                 $0.device.uniqueID == source.uniqueID
             }) else {
-                mlog.error("Could not find device for source: \(source.id)")
                 enabledSources.remove(source.id)
+                report(.sourceUnavailable(source.id), for: source)
                 return
             }
+
+            // Audio rides along only with microphone permission.
+            var includeAudio = false
+            if source.hasAudio {
+                if microphoneStatus == .authorized {
+                    includeAudio = true
+                } else {
+                    report(.permissionDenied(.microphone), for: source)
+                    if !source.hasVideo {
+                        enabledSources.remove(source.id)
+                        return
+                    }
+                }
+            }
+
             // Add device to session
-            addToSession(captureDevice: captureDevice)
+            addToSession(captureDevice: captureDevice, includeAudio: includeAudio) { [weak self] success in
+                guard let self else { return }
+                self.runOnMainActor { kit in
+                    guard kit.enabledSources.contains(source.id) else { return }
+                    if success {
+                        kit.setState(.capturing, for: source)
+                    } else {
+                        kit.enabledSources.remove(source.id)
+                        kit.report(.captureStartFailed(reason: "could not add device to session"), for: source)
+                        kit.setState(.error(.captureStartFailed(reason: "could not add device to session")), for: source)
+                    }
+                }
+            }
             mlog.info("Requested device to be added to session: \(source.displayName)")
         }
     }
 
     @MainActor
-    private func disableCaptureIsolated(for source: EnhancedCaptureSource) {
+    private func disableCaptureIsolated(for source: EnhancedCaptureSource, completion: (@Sendable () -> Void)?) {
         mlog.info("Disabling capture for source: \(source.displayName) (type: \(String(describing: source.type)))")
 
         // Remove from enabled sources set
@@ -229,119 +366,125 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             guard let captureScreen = captureScreens.first(where: {
                 $0.captureSource?.id == source.id
             }) else {
-                mlog.error("Could not find screen capture for source: \(source.id)")
-                return
-            }
-
-            captureScreen.stopCapture()
-            mlog.info("Stopped screen capture for: \(source.displayName)")
-            #else
-            mlog.debug("Screen capture not available on this platform")
-            #endif
-
-        case .externalDevice, .iOSDevice, .cameraFront, .cameraBack:
-            guard let captureDevice = captureDevices.first(where: {
-                $0.device.uniqueID == source.uniqueID
-            }) else {
-                mlog.error("Could not find device for source: \(source.id)")
-                return
-            }
-
-            removeFromSession(captureDevice: captureDevice) {
-                mlog.info("Removed device from session: \(source.displayName)")
-            }
-        }
-    }
-
-    @MainActor
-    private func disableCaptureIsolated(for source: EnhancedCaptureSource, completion: @escaping @Sendable () -> Void) {
-        mlog.info("Disabling capture for source: \(source.displayName) (type: \(String(describing: source.type)))")
-        enabledSources.remove(source.id)
-
-        switch source.type {
-        case .screen, .screenMain:
-            #if os(macOS)
-            guard let captureScreen = captureScreens.first(where: {
-                $0.captureSource?.id == source.id
-            }) else {
-                mlog.error("Could not find screen capture for source: \(source.id)")
-                completion()
+                report(.sourceUnavailable(source.id), for: source)
+                completion?()
                 return
             }
             captureScreen.stopCapture()
             mlog.info("Stopped screen capture for: \(source.displayName)")
-            completion()
+            completion?()
             #else
-            mlog.debug("Screen capture not available on this platform")
-            completion()
+            report(.platformUnsupported(feature: "screen capture"), for: source)
+            completion?()
             #endif
 
-        case .externalDevice, .iOSDevice, .cameraFront, .cameraBack:
+        case .externalDevice, .iOSDevice, .cameraFront, .cameraBack, .microphone:
             guard let captureDevice = captureDevices.first(where: {
                 $0.device.uniqueID == source.uniqueID
             }) else {
-                mlog.error("Could not find device for source: \(source.id)")
-                completion()
+                report(.sourceUnavailable(source.id), for: source)
+                completion?()
                 return
             }
-            removeFromSession(captureDevice: captureDevice) {
+
+            removeFromSession(captureDevice: captureDevice) { [weak self] in
                 mlog.info("Removed device from session: \(source.displayName)")
-                completion()
+                self?.runOnMainActor { $0.setState(.idle, for: source) }
+                completion?()
             }
         }
     }
 
     // MARK: - Session Management
 
-    private func addToSession(captureDevice: EnhancedCaptureDevice) {
+    private func addToSession(captureDevice: EnhancedCaptureDevice, includeAudio: Bool, completion: @escaping @Sendable (Bool) -> Void) {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            
+
             self.beginConfiguration()
             defer { self.commitConfiguration() }
-            
-            // Add video input and output
-            guard let input = captureDevice.input,
-                  let videoOutput = captureDevice.dataVideoOutput,
-                  self.canAddInput(input),
-                  self.canAddOutput(videoOutput) else {
-                mlog.error("Failed to add video input/output for device")
+
+            guard let input = captureDevice.input, self.canAddInput(input) else {
+                mlog.error("Failed to add input for device")
+                completion(false)
                 return
             }
 
-            // Add input and output WITHOUT automatic connections
+            // Add input WITHOUT automatic connections
             self.addInputWithNoConnections(input)
-            self.addOutputWithNoConnections(videoOutput)
 
-            // Add video connection manually
-            if let videoConnection = captureDevice.videoConnection,
-               self.canAddConnection(videoConnection) {
-                self.addConnection(videoConnection)
-                mlog.debug("Added video connection")
-            } else {
-                mlog.error("Failed to add video connection")
+            // iOS / tvOS reset the device format when the input joins; put the
+            // preference back while still inside begin/commitConfiguration.
+            #if os(iOS) || os(tvOS)
+            captureDevice.reapplyVideoPreference()
+            #endif
+
+            var addedAnything = false
+
+            // Video output + connection
+            if let videoOutput = captureDevice.dataVideoOutput {
+                if self.canAddOutput(videoOutput) {
+                    self.addOutputWithNoConnections(videoOutput)
+                    if let videoConnection = captureDevice.videoConnection,
+                       self.canAddConnection(videoConnection) {
+                        self.addConnection(videoConnection)
+                        addedAnything = true
+                        mlog.debug("Added video connection")
+                    } else {
+                        mlog.error("Failed to add video connection")
+                    }
+                } else {
+                    mlog.error("Failed to add video output for device")
+                }
             }
 
-            // Add audio output and connection if available (macOS-only: AVCaptureAudioPreviewOutput)
+            // Audio data output + connection
+            if includeAudio, let audioOutput = captureDevice.dataAudioOutput {
+                if self.canAddOutput(audioOutput) {
+                    self.addOutputWithNoConnections(audioOutput)
+                    if let audioConnection = captureDevice.audioConnection,
+                       self.canAddConnection(audioConnection) {
+                        self.addConnection(audioConnection)
+                        addedAnything = true
+                        mlog.debug("Added audio data connection")
+                    } else {
+                        mlog.error("Failed to add audio data connection")
+                    }
+                } else {
+                    mlog.error("Failed to add audio data output for device")
+                }
+            }
+
+            // Audio preview (macOS-only: AVCaptureAudioPreviewOutput)
             #if os(macOS)
-            if let audioOutput = captureDevice.audioPreview,
-               let audioConnection = captureDevice.audioConnection,
-               self.canAddOutput(audioOutput),
-               self.canAddConnection(audioConnection) {
-                self.addOutputWithNoConnections(audioOutput)
-                self.addConnection(audioConnection)
-                mlog.debug("Added audio connection")
+            if includeAudio,
+               let audioPreview = captureDevice.audioPreview,
+               let previewConnection = captureDevice.audioPreviewConnection,
+               self.canAddOutput(audioPreview),
+               self.canAddConnection(previewConnection) {
+                self.addOutputWithNoConnections(audioPreview)
+                self.addConnection(previewConnection)
+                addedAnything = true
+                mlog.debug("Added audio preview connection")
             }
             #endif
 
+            if !addedAnything {
+                // Nothing usable — don't leave a dangling input in the session.
+                self.removeInput(input)
+                completion(false)
+                return
+            }
+
             mlog.debug("Successfully added device to session")
+            completion(true)
         }
     }
-    
+
     private func removeFromSession(captureDevice: EnhancedCaptureDevice, completion: @escaping @Sendable () -> Void) {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            
+
             self.beginConfiguration()
             defer {
                 self.commitConfiguration()
@@ -349,10 +492,10 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
                     completion()
                 }
             }
-            
+
             // Check if components are still in the session before trying to remove
             // (Device may have been auto-removed by AVFoundation if unplugged)
-            
+
             // Remove connections only if they're still in the session
             if let videoConnection = captureDevice.videoConnection,
                self.connections.contains(videoConnection) {
@@ -363,8 +506,16 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             if let audioConnection = captureDevice.audioConnection,
                self.connections.contains(audioConnection) {
                 self.removeConnection(audioConnection)
-                mlog.debug("Removed audio connection")
+                mlog.debug("Removed audio data connection")
             }
+
+            #if os(macOS)
+            if let previewConnection = captureDevice.audioPreviewConnection,
+               self.connections.contains(previewConnection) {
+                self.removeConnection(previewConnection)
+                mlog.debug("Removed audio preview connection")
+            }
+            #endif
 
             // Remove outputs only if they're still in the session
             if let videoOutput = captureDevice.dataVideoOutput,
@@ -373,11 +524,17 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
                 mlog.debug("Removed video output")
             }
 
-            #if os(macOS)
-            if let audioOutput = captureDevice.audioPreview,
+            if let audioOutput = captureDevice.dataAudioOutput,
                self.outputs.contains(audioOutput) {
                 self.removeOutput(audioOutput)
-                mlog.debug("Removed audio output")
+                mlog.debug("Removed audio data output")
+            }
+
+            #if os(macOS)
+            if let audioPreview = captureDevice.audioPreview,
+               self.outputs.contains(audioPreview) {
+                self.removeOutput(audioPreview)
+                mlog.debug("Removed audio preview output")
             }
             #endif
 
@@ -391,7 +548,52 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             mlog.debug("Successfully removed device from session")
         }
     }
-    
+
+    /// Stops and restarts the session on the session queue. Also used after
+    /// `AVError.mediaServicesWereReset`.
+    public func restartSession() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if self.isRunning { self.stopRunning() }
+            self.startRunning()
+            mlog.notice("Session restarted")
+        }
+    }
+
+    // MARK: - Runtime errors / interruptions (main actor)
+
+    @MainActor
+    func handleRuntimeError(_ error: NSError?) {
+        let reason = error?.localizedDescription ?? "unknown"
+        // AVErrorMediaServicesWereReset (-11819). The Swift enum case is
+        // marked unavailable on macOS, so compare the raw code.
+        let isMediaServicesReset = error?.domain == AVFoundationErrorDomain
+            && error?.code == -11819
+        let willRestart = isMediaServicesReset && configuration.restartsAfterMediaServicesReset
+        report(.sessionRuntimeError(reason: reason, willRestart: willRestart), for: nil)
+        if willRestart { restartSession() }
+    }
+
+    @MainActor
+    func handleSessionInterruption(_ interruption: EnhancedCaptureSessionInterruption) {
+        switch interruption {
+        case .began(let reason):
+            mlog.warning("Session interrupted: \(String(describing: reason))")
+        case .ended:
+            mlog.info("Session interruption ended")
+        }
+        delegate?.enhancedCapture(self, sessionInterruptionDidChange: interruption)
+
+        // Mirror onto every enabled device source so per-source UI follows.
+        let newState: EnhancedCaptureSourceState = (interruption == .ended) ? .capturing : .interrupted
+        for source in captureSources where enabledSources.contains(source.id) {
+            switch source.type {
+            case .screen, .screenMain: continue
+            default: setState(newState, for: source)
+            }
+        }
+    }
+
     // MARK: - Screen Discovery
 #if os(macOS)
     private var isUpdatingScreens = false
@@ -422,11 +624,11 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             mlog.error("Failed to get shareable content: \(error.localizedDescription)")
             return
         }
-        
+
         // Get current display IDs from shareable content
         let currentDisplayIds = Set(content.displays.map { $0.displayID })
         let activeDisplaySet = Set(activeDisplays)
-        
+
         // Check each display in content.displays
         for display in content.displays {
             // If display is not in activeDisplays, it's new - call screenFound
@@ -435,7 +637,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             }
             // If display exists in activeDisplays, skip (no action needed)
         }
-        
+
         // Check if any activeDisplays are no longer in content.displays
         for displayId in activeDisplays {
             if !currentDisplayIds.contains(displayId) {
@@ -444,7 +646,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
 
     }
-    
+
     @MainActor
     private func screenFound(displayId: CGDirectDisplayID) {
         // Double-check that this display isn't already in the array
@@ -454,7 +656,12 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
 
         mlog.info("Found new display: \(displayId)")
-        let newCapture = EnhancedCaptureScreen(delegate: self, displayId: displayId)
+        var options = EnhancedCaptureScreen.Options()
+        options.frameRate = configuration.screenFrameRate
+        options.showsCursor = configuration.screenShowsCursor
+        options.capturesAudio = configuration.audioEnabled && configuration.screenAudioEnabled
+        options.pixelFormat = configuration.pixelFormat.coreVideoType
+        let newCapture = EnhancedCaptureScreen(delegate: self, displayId: displayId, options: options)
         guard let _ = newCapture.captureSource else {
             mlog.error("Failed to create capture source for display \(displayId)")
             return
@@ -485,6 +692,8 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
                 // Remove the capture source from the sources array if it exists
                 if let captureSource = captureScreen.captureSource {
                     kit.captureSources.removeAll { $0.id == captureSource.id }
+                    kit.enabledSources.remove(captureSource.id)
+                    kit.sourceStates.removeValue(forKey: captureSource.id)
                     mlog.debug("Removed capture source: \(captureSource.displayName)")
                 }
 
@@ -498,7 +707,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         }
     }
 #endif
-    
+
     @MainActor
     func emitCaptureSources() {
         var emittableList = [EnhancedCaptureSource]()
@@ -548,8 +757,8 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         // Update the captureSources array
         captureSources = emittableList
 
-        // Rebuild the hot-path routing snapshot (read by deviceVideoBuffer on
-        // capture callback queues — it must never scan the live arrays).
+        // Rebuild the hot-path routing snapshot (read by the sample-buffer
+        // callbacks on capture queues — they must never scan the live arrays).
         var routing: [String: EnhancedCaptureSource] = [:]
         for device in captureDevices {
             if let source = device.captureSource {
@@ -575,40 +784,61 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
     // MARK: - Device Discovery
 
     private func availableDevices() -> [AVCaptureDevice] {
-        let deviceTypes: [AVCaptureDevice.DeviceType]
+        let videoDeviceTypes: [AVCaptureDevice.DeviceType]
         #if os(iOS)
         if #available(iOS 17.0, *) {
-            deviceTypes = [.external, .builtInWideAngleCamera]
+            videoDeviceTypes = [.external, .builtInWideAngleCamera]
         } else {
-            deviceTypes = [.builtInWideAngleCamera]
+            videoDeviceTypes = [.builtInWideAngleCamera]
         }
         #else
-        deviceTypes = [.external, .builtInWideAngleCamera]
+        videoDeviceTypes = [.external, .builtInWideAngleCamera]
         #endif
 
         let videoDevices = AVCaptureDevice.DiscoverySession(
-            deviceTypes: deviceTypes,
+            deviceTypes: videoDeviceTypes,
             mediaType: .video,
             position: .unspecified
         ).devices
 
         let muxedDevices = AVCaptureDevice.DiscoverySession(
-            deviceTypes: deviceTypes,
+            deviceTypes: videoDeviceTypes,
             mediaType: .muxed,
             position: .unspecified
         ).devices
 
+        var audioDevices: [AVCaptureDevice] = []
+        if configuration.audioEnabled {
+            let audioDeviceTypes: [AVCaptureDevice.DeviceType]
+            if #available(iOS 17.0, macOS 14.0, tvOS 17.0, *) {
+                audioDeviceTypes = [.microphone, .external]
+            } else {
+                #if os(tvOS)
+                audioDeviceTypes = []
+                #else
+                audioDeviceTypes = [.builtInMicrophone]
+                #endif
+            }
+            if !audioDeviceTypes.isEmpty {
+                audioDevices = AVCaptureDevice.DiscoverySession(
+                    deviceTypes: audioDeviceTypes,
+                    mediaType: .audio,
+                    position: .unspecified
+                ).devices
+            }
+        }
+
         // Combine and remove duplicates based on uniqueID
         var uniqueDevices: [AVCaptureDevice] = []
         var seenIDs = Set<String>()
-        
-        for device in videoDevices + muxedDevices {
+
+        for device in videoDevices + muxedDevices + audioDevices {
             if !seenIDs.contains(device.uniqueID) {
                 uniqueDevices.append(device)
                 seenIDs.insert(device.uniqueID)
             }
         }
-        
+
         return uniqueDevices
     }
 
@@ -628,7 +858,7 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             mlog.debug("No capture devices found — screen capture will be used")
         }
     }
-    
+
     // MARK: - iOS Device Management (macOS only - enables iOS device capture via USB)
 
     #if os(macOS)
@@ -658,12 +888,10 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         )
     }
     #endif
-    
-    // MARK: - Public Start/Stop methods
-        
+
     // MARK: - Device Event Handlers
 
-    // Internal for access from extension files (CaptureObservers.swift)
+    // Internal for access from extension files (EnhancedCaptureObservers.swift)
     @MainActor
     func deviceFound(device: AVCaptureDevice) {
         // Check if device already exists in the array
@@ -679,14 +907,16 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
         #endif
         mlog.debug("  video: \(device.hasMediaType(.video)), audio: \(device.hasMediaType(.audio)), muxed: \(device.hasMediaType(.muxed))")
 
-        // Skip audio-only devices - they're handled as part of the main device
-        if !device.hasMediaType(.video) && !device.hasMediaType(.muxed) {
-            mlog.debug("Skipping audio-only device: \(device.localizedName)")
+        let isVideoCapable = device.hasMediaType(.video) || device.hasMediaType(.muxed)
+
+        // Audio-only devices become microphone sources only when audio is on.
+        if !isVideoCapable && !(configuration.audioEnabled && device.hasMediaType(.audio)) {
+            mlog.debug("Skipping audio-only device (audio disabled): \(device.localizedName)")
             return
         }
 
         // Create new capture device
-        let captureDevice = EnhancedCaptureDevice(device: device, delegate: self)
+        let captureDevice = EnhancedCaptureDevice(device: device, delegate: self, configuration: configuration)
 
         // Verify capture source was created
         guard let captureSource = captureDevice.captureSource else {
@@ -700,10 +930,13 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             return
         }
 
-        // Check if a device with the same display name already exists (handles same physical device with different IDs)
+        // Same physical device advertised twice with different IDs: keep one.
+        // Compared within the same media kind — a capture card's separate
+        // audio endpoint often shares the video endpoint's name.
         if captureDevices.contains(where: {
             $0.captureSource?.displayName == captureSource.displayName &&
-            $0.captureSource?.manufacturer == captureSource.manufacturer
+            $0.captureSource?.manufacturer == captureSource.manufacturer &&
+            $0.hasVideo == captureDevice.hasVideo
         }) {
             mlog.debug("Duplicate device name, skipping: \(captureSource.displayName) from \(captureSource.manufacturer)")
             return
@@ -711,45 +944,25 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
 
         // Add to devices array
         captureDevices.append(captureDevice)
-        mlog.debug("Added device. Total devices: \(self.captureDevices.count) (type: \(String(describing: captureSource.type)), manufacturer: \(captureSource.manufacturer))")
+        mlog.debug("Added device. Total devices: \(self.captureDevices.count) (type: \(String(describing: captureSource.type)), media: \(String(describing: captureSource.media)))")
 
         // Emit updated sources list
         emitCaptureSources()
     }
 
-    
-
-    private func shouldAddCaptureDevice(_ device: AVCaptureDevice) -> Bool {
-        #if os(macOS)
-        // Skip Apple built-in cameras
-        guard device.manufacturer != "Apple Inc." else { return false }
-
-        // Allow specific UVC camera manufacturers
-        let allowedManufacturers = ["Magewell", "MACROSILICON", "Blackmagic Design"]
-        if device.modelID.hasPrefix("UVC Camera") {
-            return allowedManufacturers.contains(device.manufacturer)
-        }
-
-        return true
-        #else
-        // On iOS, all devices are allowed
-        return true
-        #endif
-    }
-
-    // Internal for access from extension files (CaptureObservers.swift)
+    // Internal for access from extension files (EnhancedCaptureObservers.swift)
     @MainActor
     func deviceLost(device: AVCaptureDevice) {
         mlog.info("Device lost: \(device.localizedName) (model: \(device.modelID))")
 
         // Find the capture device with matching uniqueID
         guard let captureDevice = captureDevices.first(where: { $0.device.uniqueID == device.uniqueID }) else {
-            mlog.error("Could not find device to remove")
+            mlog.debug("Lost device was not tracked: \(device.localizedName)")
             return
         }
 
-        // Capture the source ID BEFORE removal — prepareForRemoval() may nil references
-        let sourceId = captureDevice.captureSource?.id
+        // Capture the source BEFORE removal — prepareForRemoval() may nil references
+        let source = captureDevice.captureSource
         let deviceUniqueID = device.uniqueID
 
         // Remove observers IMMEDIATELY — prevents stale callbacks from firing
@@ -771,8 +984,12 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
                 // Clean up enabledSources so the device can be re-enabled on reconnect.
                 // Without this, enableCapture() would see the stale ID and no-op,
                 // preventing frames from flowing after a disconnect/reconnect cycle.
-                if let sourceId {
-                    kit.enabledSources.remove(sourceId)
+                if let source {
+                    let wasEnabled = kit.enabledSources.remove(source.id) != nil
+                    kit.sourceStates.removeValue(forKey: source.id)
+                    if wasEnabled {
+                        kit.delegate?.enhancedCapture(kit, sourceStateDidChange: .idle, for: source)
+                    }
                     mlog.debug("Cleared enabledSources for disconnected device")
                 }
 
@@ -783,8 +1000,79 @@ public final class EnhancedCaptureKit: AVCaptureSession, @unchecked Sendable {
             }
         }
     }
-    
+
+    // MARK: - Hot-path routing
+
+    private func routedSource(for uniqueID: String) -> EnhancedCaptureSource? {
+        routingLock.lock()
+        defer { routingLock.unlock() }
+        return routingByDeviceUniqueID[uniqueID]
+    }
+
+    @MainActor
+    private func trackedDevice(for source: EnhancedCaptureSource) -> EnhancedCaptureDevice? {
+        captureDevices.first { $0.device.uniqueID == source.uniqueID }
+    }
 }
+
+// MARK: - Camera & audio controls
+
+@available(macOS 10.15, iOS 16.0, *)
+public extension EnhancedCaptureKit {
+
+    /// Sets the zoom factor of a camera source (clamped to the device's range).
+    @MainActor
+    func setZoomFactor(_ factor: CGFloat, for source: EnhancedCaptureSource) {
+        guard let device = trackedDevice(for: source) else { return report(.sourceUnavailable(source.id), for: source) }
+        do { try device.setZoomFactor(factor) }
+        catch let error as EnhancedCaptureError { report(error, for: source) }
+        catch { report(.deviceConfigurationFailed(reason: error.localizedDescription), for: source) }
+    }
+
+    /// Sets the torch (flashlight) mode of a camera source that has one.
+    @MainActor
+    func setTorchMode(_ mode: AVCaptureDevice.TorchMode, for source: EnhancedCaptureSource) {
+        guard let device = trackedDevice(for: source) else { return report(.sourceUnavailable(source.id), for: source) }
+        do { try device.setTorchMode(mode) }
+        catch let error as EnhancedCaptureError { report(error, for: source) }
+        catch { report(.deviceConfigurationFailed(reason: error.localizedDescription), for: source) }
+    }
+
+    /// Focuses and exposes at a normalized point (landscape sensor space).
+    @MainActor
+    func setFocusAndExposurePoint(_ point: CGPoint, for source: EnhancedCaptureSource) {
+        guard let device = trackedDevice(for: source) else { return report(.sourceUnavailable(source.id), for: source) }
+        do { try device.setFocusAndExposurePoint(point) }
+        catch let error as EnhancedCaptureError { report(error, for: source) }
+        catch { report(.deviceConfigurationFailed(reason: error.localizedDescription), for: source) }
+    }
+
+    /// Center Stage is a system-wide switch on the front camera (iPad,
+    /// Continuity Camera). Puts control in app mode and toggles it.
+    static func setCenterStageEnabled(_ enabled: Bool) {
+        AVCaptureDevice.centerStageControlMode = .app
+        AVCaptureDevice.isCenterStageEnabled = enabled
+    }
+
+    /// Whether Center Stage is currently on.
+    static var isCenterStageEnabled: Bool { AVCaptureDevice.isCenterStageEnabled }
+
+    #if os(iOS) || os(tvOS)
+    /// Audio inputs the shared `AVAudioSession` can route from (built-in mic,
+    /// USB-C interface, Bluetooth headset). The kit's single microphone
+    /// source follows whichever is preferred.
+    func availableAudioInputs() -> [AVAudioSessionPortDescription] {
+        AVAudioSession.sharedInstance().availableInputs ?? []
+    }
+
+    /// Routes microphone capture through `port` (`nil` restores the system default).
+    func setPreferredAudioInput(_ port: AVAudioSessionPortDescription?) throws {
+        try AVAudioSession.sharedInstance().setPreferredInput(port)
+    }
+    #endif
+}
+
+// MARK: - EnhancedCaptureScreenDelegate
 
 #if os(macOS)
 extension EnhancedCaptureKit: EnhancedCaptureScreenDelegate {
@@ -795,8 +1083,25 @@ extension EnhancedCaptureKit: EnhancedCaptureScreenDelegate {
         }
         delegate.enhancedCaptureScreenDidOutputSampleBuffer(sampleBuffer: sampleBuffer, source: source)
     }
+
+    func enhancedCaptureScreenDidOutputAudioSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource) {
+        delegate?.enhancedCaptureDidOutputAudioSampleBuffer(sampleBuffer: sampleBuffer, source: source)
+    }
+
+    func enhancedCaptureScreen(_ screen: EnhancedCaptureScreen, didChangeState state: EnhancedCaptureSourceState) {
+        guard let source = screen.captureSource else { return }
+        runOnMainActor { kit in
+            if case .error(let error) = state {
+                kit.enabledSources.remove(source.id)
+                kit.report(error, for: source)
+            }
+            kit.setState(state, for: source)
+        }
+    }
 }
 #endif
+
+// MARK: - EnhancedCaptureDeviceDelegate
 
 extension EnhancedCaptureKit: EnhancedCaptureDeviceDelegate {
     func deviceVideoBuffer(model: String, sampleBuffer: CMSampleBuffer, uniqueID: String) {
@@ -807,11 +1112,7 @@ extension EnhancedCaptureKit: EnhancedCaptureDeviceDelegate {
 
         // Frame-rate hot path on a capture callback queue: route via the
         // lock-guarded snapshot, never the main-actor-mutated arrays.
-        routingLock.lock()
-        let routedSource = routingByDeviceUniqueID[uniqueID]
-        routingLock.unlock()
-
-        if let source = routedSource {
+        if let source = routedSource(for: uniqueID) {
 
             if source.type == .iOSDevice {
                 // iOS device frames → dedicated delegate (BezelManager pipeline)
@@ -825,6 +1126,23 @@ extension EnhancedCaptureKit: EnhancedCaptureDeviceDelegate {
         }
 
         mlog.warning("Device frame from unknown uniqueID: \(uniqueID) — dropped")
+    }
+
+    func deviceAudioBuffer(sampleBuffer: CMSampleBuffer, uniqueID: String) {
+        guard let delegate, let source = routedSource(for: uniqueID) else { return }
+        delegate.enhancedCaptureDidOutputAudioSampleBuffer(sampleBuffer: sampleBuffer, source: source)
+    }
+
+    func deviceAudioLevel(_ level: EnhancedCaptureAudioLevel, uniqueID: String) {
+        guard let delegate, let source = routedSource(for: uniqueID) else { return }
+        delegate.enhancedCapture(self, didUpdateAudioLevel: level, for: source)
+    }
+
+    func deviceVideoRotationAngleDidChange(_ angle: CGFloat, uniqueID: String) {
+        guard let source = routedSource(for: uniqueID) else { return }
+        runOnMainActor { kit in
+            kit.delegate?.enhancedCapture(kit, videoRotationAngleDidChange: angle, for: source)
+        }
     }
 
     func devicePreviewLayer(previewLayer: AVCaptureVideoPreviewLayer, model: String) {
@@ -843,11 +1161,20 @@ extension EnhancedCaptureKit: PermissionManagerDelegate {
         case .camera:
             if status == .authorized {
                 // Camera authorized — start the capture session
+                let usesInputPriority = configuration.videoPreference != nil
                 sessionQueue.async { [weak self] in
                     guard let self = self else { return }
+                    // iOS / tvOS: `.high` lets AVFoundation pick each device's
+                    // format; `.inputPriority` honours the activeFormat chosen
+                    // from `configuration.videoPreference`. macOS has no such
+                    // preset — an explicitly set activeFormat is honoured under `.high`.
+                    #if os(iOS) || os(tvOS)
+                    self.sessionPreset = usesInputPriority ? .inputPriority : .high
+                    #else
                     self.sessionPreset = .high
+                    #endif
                     self.startRunning()
-                    mlog.info("Session started running (camera authorized)")
+                    mlog.info("Session started running (camera authorized, inputPriority: \(usesInputPriority))")
 
                     DispatchQueue.main.async {
                         self.delegate?.enhancedCaptureDidInitialize(self)
@@ -865,8 +1192,14 @@ extension EnhancedCaptureKit: PermissionManagerDelegate {
                 }
             }
 
+        case .microphone:
+            runOnMainActor { kit in
+                kit.microphoneStatus = status
+                mlog.info("Microphone permission: \(String(describing: status))")
+            }
+
         case .screenRecording:
-            // Screen recording status is informational — CaptureKitScreen
+            // Screen recording status is informational — EnhancedCaptureScreen
             // self-guards via CGPreflightScreenCaptureAccess() so no gating needed.
             mlog.info("Screen recording permission: \(String(describing: status))")
         }

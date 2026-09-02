@@ -104,7 +104,7 @@ let package = Package(
         // MARK: - Tests
         .testTarget(
             name: "MetalToolBoxTests",
-            dependencies: ["MetalToolBox", "VideoPlayerKit"]
+            dependencies: ["MetalToolBox", "VideoPlayerKit", "EnhancedCaptureKit"]
         ),
     ],
     swiftLanguageModes: [.v5]

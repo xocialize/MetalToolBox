@@ -5,8 +5,6 @@
 //  Created by Dustin Nielson on 2/27/26.
 //
 
-
-
 #if os(macOS)
 
 import Foundation
@@ -18,38 +16,51 @@ import LoggingKit
 
 protocol EnhancedCaptureScreenDelegate: AnyObject {
     nonisolated func enhancedCaptureScreenDidOutputSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource)
+    nonisolated func enhancedCaptureScreenDidOutputAudioSampleBuffer(sampleBuffer: CMSampleBuffer, source: EnhancedCaptureSource)
+    nonisolated func enhancedCaptureScreen(_ screen: EnhancedCaptureScreen, didChangeState state: EnhancedCaptureSourceState)
 }
 
 // MARK: - CaptureScreen
 
 public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
-    
+
+    /// Stream options fixed when the screen is discovered.
+    struct Options: Sendable {
+        var frameRate: Int32 = 30
+        var showsCursor: Bool = true
+        var capturesAudio: Bool = false
+        var pixelFormat: OSType = kCVPixelFormatType_32BGRA
+    }
+
     // MARK: - CaptureSource / displayID
-    
+
     nonisolated(unsafe) public private(set) var captureSource: EnhancedCaptureSource?
-    
+
     // Public properties accessed externally
     nonisolated(unsafe) public private(set) var displayID: CGDirectDisplayID?
-    
+
     // MARK: - Properties
-    
-    
-    
 
     // Delegate must be nonisolated(unsafe) to access from nonisolated methods
     nonisolated(unsafe) weak var delegate: EnhancedCaptureScreenDelegate?
-    
+
+    nonisolated(unsafe) private var options = Options()
+
     private let videoQueue = DispatchQueue(
-        label: "com.capturekit.EnhancedCaptureScreen.video",
+        label: "com.xocialize.MetalToolBox.EnhancedCaptureScreen.video",
+        qos: .userInteractive
+    )
+    private let audioQueue = DispatchQueue(
+        label: "com.xocialize.MetalToolBox.EnhancedCaptureScreen.audio",
         qos: .userInteractive
     )
 
     nonisolated(unsafe) private var stream: SCStream?
-    
+
     // Synchronization lock for capture state
     private let stateLock = NSLock()
     nonisolated(unsafe) private var _isCaptureActive = false
-    
+
     nonisolated private var isCaptureActive: Bool {
         get {
             stateLock.lock()
@@ -62,42 +73,43 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
             _isCaptureActive = newValue
         }
     }
-    
+
     // MARK: - Initialization
 
-    convenience init(delegate: EnhancedCaptureScreenDelegate, displayId: CGDirectDisplayID? = nil) {
+    convenience init(delegate: EnhancedCaptureScreenDelegate, displayId: CGDirectDisplayID? = nil, options: Options = Options()) {
         self.init()
         self.delegate = delegate
-        
+        self.options = options
+
         mlog.debug("[CaptureKitScreen] Initialized - checking permissions")
-        
+
         guard let displayId else {
             mlog.warning("[CaptureKitScreen] No display ID provided")
             return
         }
-        
+
         self.displayID = displayId
-        
+
         // Check permissions synchronously
         let hasPermission = CGPreflightScreenCaptureAccess()
         mlog.info("[CaptureKitScreen] Screen recording permission: \(hasPermission ? "granted" : "denied")")
-        
+
         guard hasPermission else {
             mlog.warning("[CaptureKitScreen] Screen recording permission not granted - capture will not function")
             mlog.info("[CaptureKitScreen] To grant: System Settings > Privacy & Security > Screen Recording")
             return
         }
-        
+
         // Create capture source from display information
         self.captureSource = createCaptureSource(for: displayId)
-        
+
         if captureSource == nil {
             mlog.error("[CaptureKitScreen] Failed to create capture source for display: \(displayId)")
         }
     }
-    
+
     // MARK: - Private Helpers
-    
+
     private func createCaptureSource(for displayId: CGDirectDisplayID) -> EnhancedCaptureSource? {
         guard let screen = NSScreen.screens.first(where: { screen in
             let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
@@ -105,7 +117,7 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
         }) else {
             return nil
         }
-        
+
         let localizedName = screen.localizedName
         return EnhancedCaptureSource(
             id: "screenx\(displayId)",
@@ -113,13 +125,14 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
             displayName: !localizedName.isEmpty ? localizedName : "Display \(displayId)",
             manufacturer: "Apple",
             modelID: "Screen",
-            uniqueID: "screenx\(displayId)"
+            uniqueID: "screenx\(displayId)",
+            media: options.capturesAudio ? [.video, .audio] : .video
         )
     }
-    
+
     deinit {
         mlog.debug("[CaptureKitScreen] Starting cleanup")
-        
+
         // Stop the stream synchronously if possible
         // Note: We cannot await in deinit, so we use a blocking approach
         if let stream = stream, isCaptureActive {
@@ -129,15 +142,15 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 // Error during cleanup - nothing we can do in deinit
             }
         }
-        
+
         // Clear references immediately
         self.stream = nil
         self.delegate = nil
         self.captureSource = nil
-        
+
         mlog.debug("[CaptureKitScreen] Deinitialized")
     }
-    
+
     // MARK: - Capture Control
 
     func startCapture() {
@@ -160,6 +173,7 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 guard let displayID = displayID,
                       let display = content.displays.first(where: { $0.displayID == displayID }) else {
                     mlog.error("[CaptureKitScreen] Display not found: \(String(describing: self.displayID))")
+                    delegate?.enhancedCaptureScreen(self, didChangeState: .error(.sourceUnavailable("screenx\(String(describing: self.displayID))")))
                     return
                 }
 
@@ -176,19 +190,24 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 )
 
                 // Configure stream
+                let options = self.options
                 let config = SCStreamConfiguration()
                 config.width = display.width
                 config.height = display.height
-                config.pixelFormat = kCVPixelFormatType_32BGRA
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-                config.showsCursor = true
-                config.capturesAudio = false
+                config.pixelFormat = options.pixelFormat
+                config.minimumFrameInterval = CMTime(value: 1, timescale: max(1, options.frameRate))
+                config.showsCursor = options.showsCursor
+                config.capturesAudio = options.capturesAudio
+                config.excludesCurrentProcessAudio = true
 
-                mlog.debug("[CaptureKitScreen] Stream config: \(config.width)x\(config.height)")
+                mlog.debug("[CaptureKitScreen] Stream config: \(config.width)x\(config.height) @ \(options.frameRate) fps, audio: \(options.capturesAudio)")
 
                 // Create stream
                 let captureStream = SCStream(filter: filter, configuration: config, delegate: self)
                 try captureStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
+                if options.capturesAudio {
+                    try captureStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+                }
 
                 // Start capture
                 try await captureStream.startCapture()
@@ -197,10 +216,12 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 isCaptureActive = true
 
                 mlog.info("[CaptureKitScreen] Screen capture started successfully")
+                delegate?.enhancedCaptureScreen(self, didChangeState: .capturing)
 
             } catch {
                 mlog.error("[CaptureKitScreen] Failed to start screen capture: \(error.localizedDescription)")
                 isCaptureActive = false
+                delegate?.enhancedCaptureScreen(self, didChangeState: .error(.captureStartFailed(reason: error.localizedDescription)))
             }
         }
     }
@@ -232,6 +253,7 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 self.stream = nil
                 isCaptureActive = false
             }
+            delegate?.enhancedCaptureScreen(self, didChangeState: .idle)
             if let completion {
                 DispatchQueue.main.async { completion() }
             }
@@ -246,6 +268,8 @@ extension EnhancedCaptureScreen: SCStreamDelegate {
     nonisolated public func stream(_ stream: SCStream, didStopWithError error: Error) {
         mlog.error("[CaptureKitScreen] Stream stopped with error: \(error.localizedDescription)")
         isCaptureActive = false
+        self.stream = nil
+        delegate?.enhancedCaptureScreen(self, didChangeState: .error(.streamInterrupted(reason: error.localizedDescription)))
     }
 }
 
@@ -254,16 +278,29 @@ extension EnhancedCaptureScreen: SCStreamDelegate {
 @available(macOS 14.0, *)
 extension EnhancedCaptureScreen: SCStreamOutput {
     nonisolated public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard sampleBuffer.isValid else { return }
+        guard sampleBuffer.isValid, let source = captureSource else { return }
 
         switch type {
         case .screen:
-            // Forward to delegate with source identification — already on capture queue
-            guard let source = captureSource else { return }
+            // ScreenCaptureKit also emits .idle / .blank / .suspended frames that
+            // carry no new pixels; only complete frames are worth a GPU upload.
+            guard Self.frameIsComplete(sampleBuffer) else { return }
             delegate?.enhancedCaptureScreenDidOutputSampleBuffer(sampleBuffer: sampleBuffer, source: source)
+        case .audio:
+            delegate?.enhancedCaptureScreenDidOutputAudioSampleBuffer(sampleBuffer: sampleBuffer, source: source)
         default:
             break
         }
+    }
+
+    /// `true` when the frame status attachment is missing or `.complete`.
+    nonisolated private static func frameIsComplete(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let rawStatus = attachments.first?[.status] as? Int,
+              let status = SCFrameStatus(rawValue: rawStatus) else {
+            return true
+        }
+        return status == .complete
     }
 }
 
