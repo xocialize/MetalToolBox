@@ -165,6 +165,28 @@ public struct EnhancedCaptureConfiguration: Sendable, Equatable {
     /// Draw the cursor into display captures (macOS).
     public var screenShowsCursor: Bool = true
 
+    // MARK: Test pattern
+
+    /// Offer a synthetic ``EnhancedCaptureSourceType/testPattern`` source that
+    /// renders frames in software. Enable it like any other source; it needs
+    /// no camera, no permission, and works on the iOS Simulator. Frames arrive
+    /// through `enhancedCaptureScreenDidOutputSampleBuffer(sampleBuffer:source:)`
+    /// in `pixelFormat`, stamped from the host clock like camera frames.
+    public var testPatternEnabled: Bool = false
+
+    /// What the test pattern source draws.
+    public var testPattern: EnhancedCaptureTestPattern = .colorBars
+
+    /// Frame size of the test pattern (rounded down to even dimensions).
+    public var testPatternSize: CGSize = CGSize(width: 1920, height: 1080)
+
+    /// Frame rate of the test pattern, 1…240.
+    public var testPatternFrameRate: Double = 30
+
+    /// Draw a moving bar and a binary frame counter so motion, dropped
+    /// frames and latency are visible.
+    public var testPatternAnimated: Bool = true
+
     // MARK: iOS / iPadOS session behaviour
 
     /// Keep the camera running in Split View, Slide Over and Stage Manager.

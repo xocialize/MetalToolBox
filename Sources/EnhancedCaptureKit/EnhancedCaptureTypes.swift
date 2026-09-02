@@ -42,6 +42,11 @@ public enum EnhancedCaptureSourceType: Sendable, Hashable {
     /// route (built-in, USB-C, Bluetooth) follows the app's `AVAudioSession`
     /// preferred input — see ``EnhancedCaptureKit/setPreferredAudioInput(_:)``.
     case microphone
+
+    /// Synthetic frames (colour bars, ramp, checkerboard, solid colour)
+    /// generated in software. Needs no camera or permission and runs on the
+    /// Simulator. Present only when ``EnhancedCaptureConfiguration/testPatternEnabled`` is set.
+    case testPattern
 }
 
 // MARK: - Media kinds
@@ -68,6 +73,7 @@ public struct EnhancedCaptureSource: Sendable, Hashable, Identifiable {
     /// - External device / microphone: device uniqueID (e.g., "0x1234567890abcdef")
     /// - iOS device: device uniqueID (e.g., "abc123-device-id")
     /// - Screen: "screenx{displayID}" (e.g., "screenx1", "screenx4280844032")
+    /// - Test pattern: "test-pattern-{pattern}" (e.g., "test-pattern-color-bars")
     public let id: String
 
     /// The type of capture source

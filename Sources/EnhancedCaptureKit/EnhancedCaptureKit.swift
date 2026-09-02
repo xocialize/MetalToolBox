@@ -133,6 +133,7 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
 
     public var captureSources: [EnhancedCaptureSource] = []
     private var captureDevices: [EnhancedCaptureDevice] = []
+    private var testPatternSource: EnhancedCaptureTestPatternSource?
 
     // Track which sources are currently enabled/capturing
     private var enabledSources: Set<String> = []
@@ -197,6 +198,10 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
             // Device discovery (populates device list so sources are ready
             // when the session starts)
             self.refreshDevices()
+            if self.configuration.testPatternEnabled {
+                self.testPatternSource = EnhancedCaptureTestPatternSource(configuration: self.configuration, delegate: self)
+                self.emitCaptureSources()
+            }
             #if os(macOS)
             await self.screensDidUpdate()
             #endif
@@ -419,6 +424,18 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
             }
 
             addDeviceToSession(captureDevice, includeAudio: includeAudio, source: source)
+
+        case .testPattern:
+            guard let generator = testPatternSource, generator.captureSource.id == source.id else {
+                enabledSources.remove(source.id)
+                report(.sourceUnavailable(source.id), for: source)
+                return
+            }
+            if let error = generator.start() {
+                fail(source, with: error)
+            } else {
+                setState(.capturing, for: source)
+            }
         }
     }
 
@@ -502,6 +519,11 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
                 self?.runOnMainActor { $0.setState(.idle, for: source) }
                 completion?()
             }
+
+        case .testPattern:
+            testPatternSource?.stop()
+            setState(.idle, for: source)
+            completion?()
         }
     }
 
@@ -713,7 +735,7 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
         let newState: EnhancedCaptureSourceState = (interruption == .ended) ? .capturing : .interrupted
         for source in captureSources where enabledSources.contains(source.id) {
             switch source.type {
-            case .screen, .screenMain: continue
+            case .screen, .screenMain, .testPattern: continue
             default: setState(newState, for: source)
             }
         }
@@ -878,6 +900,12 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
             } else if let captureSource = device.captureSource {
                 mlog.debug("Skipping duplicate device source: \(captureSource.displayName)")
             }
+        }
+
+        // Synthetic source, when configured
+        if let generatorSource = testPatternSource?.captureSource, !seenIDs.contains(generatorSource.id) {
+            emittableList.append(generatorSource)
+            seenIDs.insert(generatorSource.id)
         }
 
         // Update the captureSources array
@@ -1245,6 +1273,15 @@ extension EnhancedCaptureKit: EnhancedCaptureScreenDelegate {
     }
 }
 #endif
+
+// MARK: - EnhancedCaptureTestPatternSourceDelegate
+
+extension EnhancedCaptureKit: EnhancedCaptureTestPatternSourceDelegate {
+    func testPatternSource(_ source: EnhancedCaptureTestPatternSource, didOutput sampleBuffer: CMSampleBuffer) {
+        // Same path as an external device: a video source the consumer enabled.
+        delegate?.enhancedCaptureScreenDidOutputSampleBuffer(sampleBuffer: sampleBuffer, source: source.captureSource)
+    }
+}
 
 // MARK: - EnhancedCaptureDeviceDelegate
 
