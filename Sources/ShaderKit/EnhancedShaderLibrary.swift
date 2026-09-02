@@ -97,4 +97,9 @@ public class EnhancedShaderLibrary {
     public func fragmentDisplay() -> MTLFunction? {
         library.makeFunction(name: EnhancedShaderFunction.fragmentDisplay)
     }
+
+    /// Returns the biplanar YCbCr → BGRA compute kernel.
+    public func computeYCbCrToBGRA() -> MTLFunction? {
+        library.makeFunction(name: EnhancedShaderFunction.computeYCbCrToBGRA)
+    }
 }

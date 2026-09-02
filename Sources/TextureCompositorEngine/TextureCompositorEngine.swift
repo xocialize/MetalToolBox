@@ -78,6 +78,11 @@ public class TextureCompositorEngine {
     /// Injected shader library — used instead of Bundle.module when provided.
     private var shaderLibrary: EnhancedShaderLibrary?
 
+    /// Biplanar YCbCr (420v / 420f) → BGRA, built on first such frame. Shares
+    /// the engine's command queue so conversions are ordered ahead of render().
+    private var ycbcrConverter: YCbCrTextureConverter?
+    private var ycbcrConverterUnavailable = false
+
     // MARK: - Initialization
 
     public init?(device: MTLDevice?, shaderLibrary: MTLLibrary? = nil, commandQueue: MTLCommandQueue? = nil) {
@@ -326,34 +331,46 @@ public class TextureCompositorEngine {
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
 
-        let mtlFormat: MTLPixelFormat
-        switch format {
-        case kCVPixelFormatType_32BGRA:
-            mtlFormat = .bgra8Unorm
-        case kCVPixelFormatType_32RGBA:
-            mtlFormat = .rgba8Unorm
-        default:
-            mtlFormat = .bgra8Unorm
-        }
+        let mtlTexture: MTLTexture
+        if YCbCrTextureConverter.handles(format) {
+            // Camera-native 4:2:0: one compute pass to BGRA on the engine's queue.
+            guard let converter = resolveYCbCrConverter(),
+                  let converted = converter.convert(pixelBuffer, textureCache: textureCache) else {
+                mlog.error("Failed to convert YCbCr pixel buffer for zone: \(destinationZone)")
+                return
+            }
+            mtlTexture = converted
+        } else {
+            let mtlFormat: MTLPixelFormat
+            switch format {
+            case kCVPixelFormatType_32BGRA:
+                mtlFormat = .bgra8Unorm
+            case kCVPixelFormatType_32RGBA:
+                mtlFormat = .rgba8Unorm
+            default:
+                mtlFormat = .bgra8Unorm
+            }
 
-        var cvTexture: CVMetalTexture?
-        let status = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault,
-            textureCache,
-            pixelBuffer,
-            nil,
-            mtlFormat,
-            width,
-            height,
-            0,
-            &cvTexture
-        )
+            var cvTexture: CVMetalTexture?
+            let status = CVMetalTextureCacheCreateTextureFromImage(
+                kCFAllocatorDefault,
+                textureCache,
+                pixelBuffer,
+                nil,
+                mtlFormat,
+                width,
+                height,
+                0,
+                &cvTexture
+            )
 
-        guard status == kCVReturnSuccess,
-              let cvTex = cvTexture,
-              let mtlTexture = CVMetalTextureGetTexture(cvTex) else {
-            mlog.error("Failed to convert pixel buffer for zone: \(destinationZone)")
-            return
+            guard status == kCVReturnSuccess,
+                  let cvTex = cvTexture,
+                  let wrapped = CVMetalTextureGetTexture(cvTex) else {
+                mlog.error("Failed to convert pixel buffer for zone: \(destinationZone)")
+                return
+            }
+            mtlTexture = wrapped
         }
 
         textureLock.lock()
@@ -371,6 +388,20 @@ public class TextureCompositorEngine {
 
         item.texture = mtlTexture
         item.lastInputSize = newSize
+    }
+
+    /// Lazily builds the YCbCr converter from the resolved shader library.
+    private func resolveYCbCrConverter() -> YCbCrTextureConverter? {
+        if let ycbcrConverter { return ycbcrConverter }
+        if ycbcrConverterUnavailable { return nil }
+        guard let device, let shaderLibrary,
+              let converter = YCbCrTextureConverter(device: device, shaderLibrary: shaderLibrary, commandQueue: commandQueue) else {
+            mlog.error("Biplanar YCbCr input needs the MetalToolBox shader library — dropping frames")
+            ycbcrConverterUnavailable = true
+            return nil
+        }
+        ycbcrConverter = converter
+        return converter
     }
 
     // MARK: - Pipeline State

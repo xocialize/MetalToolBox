@@ -37,4 +37,10 @@ public enum EnhancedShaderFunction {
     /// Samples from texture(0) with linear filtering and clamp-to-edge addressing.
     /// Shared by all vertex shaders.
     public static let fragmentDisplay = "fzc_displayTexture"
+
+    /// Compute kernel: biplanar 4:2:0 YCbCr (420v / 420f) → BGRA.
+    /// texture(0) luma r8Unorm, texture(1) chroma rg8Unorm, texture(2) BGRA
+    /// output, buffer(0) `FZCYCbCrConversion` (range + matrix).
+    /// Used by: `YCbCrTextureConverter`.
+    public static let computeYCbCrToBGRA = "fzc_ycbcrBiPlanarToBGRA"
 }
