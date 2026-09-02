@@ -36,6 +36,17 @@ public struct EnhancedCaptureAudioBuffer: @unchecked Sendable {
     public var presentationTime: CMTime { CMSampleBufferGetPresentationTimeStamp(sampleBuffer) }
 }
 
+/// One depth map from a LiDAR / TrueDepth camera. `AVDepthData` is an
+/// immutable CoreMedia-backed object, hence `@unchecked Sendable`.
+public struct EnhancedCaptureDepthFrame: @unchecked Sendable {
+    public let depthData: AVDepthData
+    public let timestamp: CMTime
+    public let source: EnhancedCaptureSource
+
+    /// The float16 depth or disparity map.
+    public var depthMap: CVPixelBuffer { depthData.depthDataMap }
+}
+
 /// A level reading for an audio-capable source.
 public struct EnhancedCaptureAudioLevelUpdate: Sendable {
     public let level: EnhancedCaptureAudioLevel
@@ -106,6 +117,7 @@ public final class EnhancedCaptureStreams: @unchecked Sendable {
     private var levelSubscribers: [UUID: AsyncStream<EnhancedCaptureAudioLevelUpdate>.Continuation] = [:]
     private var videoSubscribers: [String: [UUID: AsyncStream<EnhancedCaptureVideoFrame>.Continuation]] = [:]
     private var audioSubscribers: [String: [UUID: AsyncStream<EnhancedCaptureAudioBuffer>.Continuation]] = [:]
+    private var depthSubscribers: [String: [UUID: AsyncStream<EnhancedCaptureDepthFrame>.Continuation]] = [:]
 
     /// Creates the kit and starts discovery, exactly like
     /// `EnhancedCaptureKit(delegate:configuration:)`.
@@ -124,6 +136,7 @@ public final class EnhancedCaptureStreams: @unchecked Sendable {
             + levelSubscribers.values.map { c in { c.finish() } }
             + videoSubscribers.values.flatMap { $0.values }.map { c in { c.finish() } }
             + audioSubscribers.values.flatMap { $0.values }.map { c in { c.finish() } }
+            + depthSubscribers.values.flatMap { $0.values }.map { c in { c.finish() } }
         lock.unlock()
         all.forEach { $0() }
     }
@@ -196,6 +209,15 @@ public final class EnhancedCaptureStreams: @unchecked Sendable {
         }
     }
 
+    /// Depth maps from `source` (iOS, `depthDataEnabled`), newest only.
+    public func depthFrames(for source: EnhancedCaptureSource) -> AsyncStream<EnhancedCaptureDepthFrame> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(Self.videoBufferDepth)) { continuation in
+            let id = UUID()
+            lock.lock(); depthSubscribers[source.id, default: [:]][id] = continuation; lock.unlock()
+            continuation.onTermination = { [weak self] _ in self?.remove(depth: id, sourceID: source.id) }
+        }
+    }
+
     // MARK: Fan-out (any thread)
 
     func publish(sources: [EnhancedCaptureSource]) {
@@ -236,6 +258,15 @@ public final class EnhancedCaptureStreams: @unchecked Sendable {
         targets.forEach { $0.yield(buffer) }
     }
 
+    func publish(depthData: AVDepthData, timestamp: CMTime, for source: EnhancedCaptureSource) {
+        lock.lock()
+        let targets = depthSubscribers[source.id].map { Array($0.values) } ?? []
+        lock.unlock()
+        guard !targets.isEmpty else { return }
+        let frame = EnhancedCaptureDepthFrame(depthData: depthData, timestamp: timestamp, source: source)
+        targets.forEach { $0.yield(frame) }
+    }
+
     /// Subscriber counts, for tests and diagnostics.
     var subscriberCounts: (sources: Int, events: Int, levels: Int, video: Int, audio: Int) {
         lock.lock(); defer { lock.unlock() }
@@ -263,6 +294,12 @@ public final class EnhancedCaptureStreams: @unchecked Sendable {
         lock.lock()
         audioSubscribers[sourceID]?.removeValue(forKey: id)
         if audioSubscribers[sourceID]?.isEmpty == true { audioSubscribers.removeValue(forKey: sourceID) }
+        lock.unlock()
+    }
+    private func remove(depth id: UUID, sourceID: String) {
+        lock.lock()
+        depthSubscribers[sourceID]?.removeValue(forKey: id)
+        if depthSubscribers[sourceID]?.isEmpty == true { depthSubscribers.removeValue(forKey: sourceID) }
         lock.unlock()
     }
 }
@@ -326,5 +363,10 @@ extension EnhancedCaptureStreams: EnhancedCaptureDelegate {
     public func enhancedCapture(_ manager: EnhancedCaptureKit, videoRotationAngleDidChange angle: CGFloat, for source: EnhancedCaptureSource) {
         publish(event: .rotation(angle, source))
         forwardingDelegate?.enhancedCapture(manager, videoRotationAngleDidChange: angle, for: source)
+    }
+
+    public func enhancedCaptureDidOutputDepthData(depthData: AVDepthData, timestamp: CMTime, source: EnhancedCaptureSource) {
+        publish(depthData: depthData, timestamp: timestamp, for: source)
+        forwardingDelegate?.enhancedCaptureDidOutputDepthData(depthData: depthData, timestamp: timestamp, source: source)
     }
 }

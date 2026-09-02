@@ -165,6 +165,19 @@ public struct EnhancedCaptureConfiguration: Sendable, Equatable {
     /// Draw the cursor into display captures (macOS).
     public var screenShowsCursor: Bool = true
 
+    // MARK: Depth (iOS / iPadOS)
+
+    /// Deliver `AVDepthData` from cameras that have a depth sensor (LiDAR on
+    /// iPad Pro / iPhone Pro back cameras, TrueDepth in front) through
+    /// `enhancedCaptureDidOutputDepthData(depthData:timestamp:source:)`.
+    /// Such a source reports `.depth` in its `media`. Depth needs a video
+    /// format that supports it; the kit prefers one when this is on, using
+    /// ``EnhancedCaptureVideoPreference/hd1080p30`` if no preference is set.
+    public var depthDataEnabled: Bool = false
+
+    /// Let AVFoundation fill holes and smooth the depth map temporally.
+    public var depthDataFiltered: Bool = true
+
     // MARK: Test pattern
 
     /// Offer a synthetic ``EnhancedCaptureSourceType/testPattern`` source that

@@ -58,6 +58,8 @@ public struct EnhancedCaptureMediaKinds: OptionSet, Sendable, Hashable {
 
     public static let video = EnhancedCaptureMediaKinds(rawValue: 1 << 0)
     public static let audio = EnhancedCaptureMediaKinds(rawValue: 1 << 1)
+    /// iOS: `AVDepthData` from a LiDAR or TrueDepth camera alongside video.
+    public static let depth = EnhancedCaptureMediaKinds(rawValue: 1 << 2)
 }
 
 // MARK: - CaptureSource
@@ -120,6 +122,9 @@ public struct EnhancedCaptureSource: Sendable, Hashable, Identifiable {
 
     /// `true` when enabling this source delivers video sample buffers.
     public var hasVideo: Bool { media.contains(.video) }
+
+    /// `true` when enabling this source also delivers depth data (iOS, LiDAR / TrueDepth).
+    public var hasDepth: Bool { media.contains(.depth) }
 }
 
 // MARK: - CaptureSourceState

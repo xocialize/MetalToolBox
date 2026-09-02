@@ -24,6 +24,9 @@ struct EnhancedCaptureFormatCandidate: Equatable {
     /// iOS: the format can run inside an `AVCaptureMultiCamSession`. Always
     /// `true` on macOS, which has no multi-camera session.
     var isMultiCamSupported: Bool = true
+    /// iOS: the format can deliver depth data (`supportedDepthDataFormats`
+    /// is non-empty). Always `false` on macOS.
+    var supportsDepth: Bool = false
 
     var pixelArea: Int { Int(width) * Int(height) }
 
@@ -45,6 +48,8 @@ enum EnhancedCaptureFormatSelector {
     /// Rules, in order:
     /// 0. With `requireMultiCamSupport`, drop candidates that cannot run in a
     ///    multi-camera session (no fallback: such a format cannot be used).
+    /// 0b. With `preferDepthSupport`, keep depth-capable candidates when there
+    ///    are any (depth is optional: fall back to all if none can).
     /// 1. Keep only candidates supporting `preferredFrameRate` (fall back to
     ///    all remaining candidates if none do).
     /// 2. With a `preferredSize`, prefer candidates that cover it, choosing the
@@ -55,7 +60,8 @@ enum EnhancedCaptureFormatSelector {
     static func bestIndex(
         among candidates: [EnhancedCaptureFormatCandidate],
         preference: EnhancedCaptureVideoPreference,
-        requireMultiCamSupport: Bool = false
+        requireMultiCamSupport: Bool = false,
+        preferDepthSupport: Bool = false
     ) -> Int? {
         guard !candidates.isEmpty else { return nil }
 
@@ -63,6 +69,10 @@ enum EnhancedCaptureFormatSelector {
         if requireMultiCamSupport {
             pool = pool.filter { candidates[$0].isMultiCamSupported }
             guard !pool.isEmpty else { return nil }
+        }
+        if preferDepthSupport {
+            let depthPool = pool.filter { candidates[$0].supportsDepth }
+            if !depthPool.isEmpty { pool = depthPool }
         }
         if let fps = preference.preferredFrameRate {
             let fpsPool = pool.filter { candidates[$0].supports(frameRate: fps) }
@@ -120,13 +130,15 @@ extension AVCaptureDevice.Format {
         #if os(iOS)
         let binned = isVideoBinned
         let multiCam = isMultiCamSupported
+        let depth = !supportedDepthDataFormats.isEmpty
         #else
         let binned = false
         let multiCam = true
+        let depth = false
         #endif
         return EnhancedCaptureFormatCandidate(
             width: dims.width, height: dims.height, frameRateRanges: ranges,
-            isBinned: binned, isMultiCamSupported: multiCam
+            isBinned: binned, isMultiCamSupported: multiCam, supportsDepth: depth
         )
     }
 }
@@ -139,13 +151,14 @@ extension AVCaptureDevice {
     /// accepts are considered. Returns the chosen format, or `nil` when the
     /// device has no usable format.
     @discardableResult
-    func applyVideoPreference(_ preference: EnhancedCaptureVideoPreference, requireMultiCamSupport: Bool = false) throws -> AVCaptureDevice.Format? {
+    func applyVideoPreference(_ preference: EnhancedCaptureVideoPreference, requireMultiCamSupport: Bool = false, preferDepthSupport: Bool = false) throws -> AVCaptureDevice.Format? {
         let videoFormats = formats.filter {
             CMFormatDescriptionGetMediaType($0.formatDescription) == kCMMediaType_Video
         }
         let candidates = videoFormats.map(\.enhancedCandidate)
         guard let index = EnhancedCaptureFormatSelector.bestIndex(
-            among: candidates, preference: preference, requireMultiCamSupport: requireMultiCamSupport
+            among: candidates, preference: preference,
+            requireMultiCamSupport: requireMultiCamSupport, preferDepthSupport: preferDepthSupport
         ) else {
             return nil
         }

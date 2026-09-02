@@ -68,6 +68,13 @@ public protocol EnhancedCaptureDelegate: AnyObject {
     /// (0, 90, 180, 270 degrees). Reported once when the camera is discovered
     /// and again on every change. Main thread.
     func enhancedCapture(_ manager: EnhancedCaptureKit, videoRotationAngleDidChange angle: CGFloat, for source: EnhancedCaptureSource)
+
+    /// iOS / iPadOS: depth (LiDAR) or disparity (TrueDepth) for a camera
+    /// source with `.depth` in its media. Requires
+    /// `configuration.depthDataEnabled`. `depthData.depthDataMap` is a
+    /// float16 CVPixelBuffer at the depth sensor's resolution; `timestamp`
+    /// matches the video frame it belongs to. Depth queue.
+    func enhancedCaptureDidOutputDepthData(depthData: AVDepthData, timestamp: CMTime, source: EnhancedCaptureSource)
 }
 
 public extension EnhancedCaptureDelegate {
@@ -79,6 +86,7 @@ public extension EnhancedCaptureDelegate {
     func enhancedCapture(_ manager: EnhancedCaptureKit, sessionInterruptionDidChange interruption: EnhancedCaptureSessionInterruption) {}
     func enhancedCapture(_ manager: EnhancedCaptureKit, didEncounterError error: EnhancedCaptureError, for source: EnhancedCaptureSource?) {}
     func enhancedCapture(_ manager: EnhancedCaptureKit, videoRotationAngleDidChange angle: CGFloat, for source: EnhancedCaptureSource) {}
+    func enhancedCaptureDidOutputDepthData(depthData: AVDepthData, timestamp: CMTime, source: EnhancedCaptureSource) {}
 }
 
 /// ── Threading contract ────────────────────────────────────────────────
@@ -589,6 +597,12 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
         #endif
 
         var addedAnything = attach(captureDevice.dataVideoOutput, captureDevice.videoConnection, label: "video")
+        #if os(iOS)
+        if captureDevice.deliversDepth {
+            // Depth is a bonus on top of video; its failure never fails the device.
+            _ = attach(captureDevice.depthDataOutput, captureDevice.depthConnection, label: "depth")
+        }
+        #endif
         if includeAudio {
             addedAnything = attach(captureDevice.dataAudioOutput, captureDevice.audioConnection, label: "audio data") || addedAnything
         }
@@ -667,6 +681,10 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
         #if os(macOS)
         connections.append((captureDevice.audioPreviewConnection, "audio preview"))
         outputs.append((captureDevice.audioPreview, "audio preview"))
+        #endif
+        #if os(iOS)
+        connections.append((captureDevice.depthConnection, "depth"))
+        outputs.append((captureDevice.depthDataOutput, "depth"))
         #endif
 
         for case (let connection?, let label) in connections where session.connections.contains(connection) {
@@ -1335,6 +1353,11 @@ extension EnhancedCaptureKit: EnhancedCaptureDeviceDelegate {
         runOnMainActor { kit in
             kit.report(.systemPressureElevated(level: level), for: source)
         }
+    }
+
+    func deviceDepthData(_ depthData: AVDepthData, timestamp: CMTime, uniqueID: String) {
+        guard let delegate, let source = routedSource(for: uniqueID) else { return }
+        delegate.enhancedCaptureDidOutputDepthData(depthData: depthData, timestamp: timestamp, source: source)
     }
 
     func devicePreviewLayer(previewLayer: AVCaptureVideoPreviewLayer, model: String) {

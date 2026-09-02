@@ -30,6 +30,7 @@ protocol EnhancedCaptureDeviceDelegate: AnyObject {
     func deviceAudioLevel(_ level: EnhancedCaptureAudioLevel, uniqueID: String)
     func deviceVideoRotationAngleDidChange(_ angle: CGFloat, uniqueID: String)
     func deviceSystemPressureDidChange(level: String, isElevated: Bool, uniqueID: String)
+    func deviceDepthData(_ depthData: AVDepthData, timestamp: CMTime, uniqueID: String)
     func devicePreviewLayer(previewLayer: AVCaptureVideoPreviewLayer, model: String)
 }
 
@@ -51,6 +52,9 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     private var observers: [NSObjectProtocol] = []
     private let videoQueue: DispatchQueue
     private let audioQueue: DispatchQueue
+    #if os(iOS)
+    private let depthQueue: DispatchQueue
+    #endif
 
     private(set) var previewLayer: AVCaptureVideoPreviewLayer?
 
@@ -74,6 +78,22 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     private(set) var audioPreviewConnection: AVCaptureConnection?
     #endif
     private(set) var videoPreviewConnectionActive: Bool = false
+
+    #if os(iOS)
+    /// Depth port → `AVCaptureDepthDataOutput` (LiDAR / TrueDepth).
+    private(set) var depthDataOutput: AVCaptureDepthDataOutput?
+    private(set) var depthConnection: AVCaptureConnection?
+    private var depthPort: AVCaptureInput.Port?
+    #endif
+
+    /// The device has a depth sensor and `depthDataEnabled` is on.
+    var deliversDepth: Bool {
+        #if os(iOS)
+        return depthDataOutput != nil
+        #else
+        return false
+        #endif
+    }
 
     /// The device's input opened with a video port (camera, capture card, iOS
     /// device). Port-based: false when the input could not be opened. Use
@@ -115,6 +135,12 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
             label: "com.xocialize.MetalToolBox.EnhancedCaptureDevice.audio.\(device.uniqueID)",
             qos: .userInteractive
         )
+        #if os(iOS)
+        self.depthQueue = DispatchQueue(
+            label: "com.xocialize.MetalToolBox.EnhancedCaptureDevice.depth.\(device.uniqueID)",
+            qos: .userInteractive
+        )
+        #endif
         super.init()
         setupCaptureDevice()
 
@@ -173,6 +199,7 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         var media = EnhancedCaptureMediaKinds()
         if videoCapable { media.insert(.video) }
         if audioCapable && configuration.audioEnabled { media.insert(.audio) }
+        if deliversDepth { media.insert(.depth) }
 
         // Create the capture source
         return EnhancedCaptureSource(
@@ -199,6 +226,7 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         setupVideoConnection()
         setupAudio()
         #if os(iOS)
+        setupDepth()
         setupRotationCoordinator()
         setupSystemPressureObserver()
         #endif
@@ -247,18 +275,28 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     /// A multi-camera session accepts only formats with `isMultiCamSupported`
     /// and has no `.high` preset to fall back on, so it always gets a
     /// preference — the configured one, or 1080p30.
+    ///
+    /// Depth delivery needs a format that supports it, so with depth on and
+    /// no preference the kit also asks for 1080p30 rather than leaving the
+    /// `.high` preset in charge.
     func reapplyVideoPreference(multiCamera: Bool) {
         guard hasVideo else { return }
+        let wantsDepth = deliversDepth
         if multiCamera {
-            apply(configuration.videoPreference ?? .hd1080p30, requireMultiCamSupport: true)
+            apply(configuration.videoPreference ?? .hd1080p30, requireMultiCamSupport: true, preferDepthSupport: wantsDepth)
         } else if let preference = configuration.videoPreference {
-            apply(preference)
+            apply(preference, preferDepthSupport: wantsDepth)
+        } else if wantsDepth {
+            apply(.hd1080p30, preferDepthSupport: true)
         }
+        #if os(iOS)
+        applyDepthFormat()
+        #endif
     }
 
-    private func apply(_ preference: EnhancedCaptureVideoPreference, requireMultiCamSupport: Bool = false) {
+    private func apply(_ preference: EnhancedCaptureVideoPreference, requireMultiCamSupport: Bool = false, preferDepthSupport: Bool = false) {
         do {
-            if try device.applyVideoPreference(preference, requireMultiCamSupport: requireMultiCamSupport) == nil {
+            if try device.applyVideoPreference(preference, requireMultiCamSupport: requireMultiCamSupport, preferDepthSupport: preferDepthSupport) == nil {
                 mlog.warning("No usable video format on \(self.device.localizedName) (multi-camera: \(requireMultiCamSupport)); keeping default format")
             }
         } catch {
@@ -272,13 +310,21 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
             input = deviceInput
 
             for port in deviceInput.ports {
-                if port.mediaType == .audio {
+                switch port.mediaType {
+                case .audio:
                     audioPort = port
                     mlog.debug("Audio port configured")
-                } else if port.mediaType == .video {
+                case .video:
                     videoPort = port
                     mlog.debug("Video port configured")
                     setupVideoPortObserver(for: port)
+                default:
+                    #if os(iOS)
+                    if port.mediaType == .depthData {
+                        depthPort = port
+                        mlog.debug("Depth port present")
+                    }
+                    #endif
                 }
             }
         } catch {
@@ -386,6 +432,58 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         }
         #endif
     }
+
+    // MARK: - Depth (iOS / iPadOS)
+
+    #if os(iOS)
+    /// Wires an `AVCaptureDepthDataOutput` to the depth port when the device
+    /// has a depth sensor and depth is requested. The depth *format* is chosen
+    /// per video format in `applyDepthFormat()`, inside the session's
+    /// configuration block, because AVFoundation resets it with `activeFormat`.
+    private func setupDepth() {
+        guard configuration.depthDataEnabled, hasVideo, let depthPort else { return }
+        let depthCapable = device.formats.contains { !$0.supportedDepthDataFormats.isEmpty }
+        guard depthCapable else {
+            mlog.debug("\(self.device.localizedName) has no depth-capable format")
+            return
+        }
+        let output = AVCaptureDepthDataOutput()
+        output.isFilteringEnabled = configuration.depthDataFiltered
+        output.alwaysDiscardsLateDepthData = true
+        output.setDelegate(self, callbackQueue: depthQueue)
+        depthDataOutput = output
+        depthConnection = AVCaptureConnection(inputPorts: [depthPort], output: output)
+        mlog.debug("Depth data connection configured")
+    }
+
+    /// Picks the largest float16 depth (or disparity) format the active video
+    /// format supports. Call inside begin/commitConfiguration after the video format.
+    func applyDepthFormat() {
+        guard deliversDepth else { return }
+        let formats = device.activeFormat.supportedDepthDataFormats
+        guard !formats.isEmpty else {
+            mlog.warning("Active format on \(self.device.localizedName) has no depth formats — depth will not flow")
+            return
+        }
+        func width(_ format: AVCaptureDevice.Format) -> Int32 {
+            CMVideoFormatDescriptionGetDimensions(format.formatDescription).width
+        }
+        func isFloat16(_ format: AVCaptureDevice.Format) -> Bool {
+            let sub = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+            return sub == kCVPixelFormatType_DepthFloat16 || sub == kCVPixelFormatType_DisparityFloat16
+        }
+        let preferred = formats.filter(isFloat16).max { width($0) < width($1) } ?? formats.max { width($0) < width($1) }
+        guard let chosen = preferred else { return }
+        do {
+            try device.lockForConfiguration()
+            device.activeDepthDataFormat = chosen
+            device.unlockForConfiguration()
+            mlog.debug("Depth format \(width(chosen)) px wide for \(self.device.localizedName)")
+        } catch {
+            mlog.error("Failed to set depth format: \(error.localizedDescription)")
+        }
+    }
+    #endif
 
     // MARK: - Rotation (iOS / iPadOS)
 
@@ -539,6 +637,9 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         #endif
         #if os(iOS)
         rotationCoordinator = nil
+        depthConnection = nil
+        depthDataOutput = nil
+        depthPort = nil
         #endif
         input = nil
         audioPort = nil
@@ -589,3 +690,11 @@ extension EnhancedCaptureDevice: AVCaptureVideoDataOutputSampleBufferDelegate, A
         )
     }
 }
+
+#if os(iOS)
+extension EnhancedCaptureDevice: AVCaptureDepthDataOutputDelegate {
+    func depthDataOutput(_ output: AVCaptureDepthDataOutput, didOutput depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection) {
+        delegate?.deviceDepthData(depthData, timestamp: timestamp, uniqueID: device.uniqueID)
+    }
+}
+#endif

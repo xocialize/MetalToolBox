@@ -33,17 +33,17 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
 | Audio levels | none | scalar peak/RMS; EBU R128 fields are placeholders (RMS − 0.691) | AVFoundation `AVCaptureAudioChannel` peak/average per channel, throttled |
 | `AVAudioSession` handling (iOS) | none | sets `.playAndRecord/.measurement` unconditionally | policy: automatic / applicationManaged / detached; preferred-input helpers |
 | Format / frame-rate selection | picked widest format, then `.high` preset overrode it on iOS | first format matching fps (no resolution match) | `EnhancedCaptureVideoPreference` → scored selection, `.inputPriority` on iOS/tvOS, re-applied after input joins |
-| Pixel format | BGRA hard-coded | NV12/BGRA/P010/… | BGRA default, 420v/420f selectable (needs a two-plane `TextureConverter` path to be useful) |
+| Pixel format | BGRA hard-coded | NV12/BGRA/P010/… | BGRA default; 420v/420f end to end — `YCbCrTextureConverter` converts on the GPU in `TextureConverter` and the compositor (2.0.0) |
 | Session interruptions (iOS) | none (`.interrupted` state existed but was never set) | none | `wasInterrupted` / `interruptionEnded` → delegate + per-source state |
 | Runtime errors / media-services reset | none | none | reported; auto-restart on `AVErrorMediaServicesWereReset` |
 | iPad multitasking camera access (Split View, Stage Manager) | none | none | enabled when entitled (`isMultitaskingCameraAccessSupported`) |
 | Camera rotation (iOS 17 `RotationCoordinator`) | none — portrait iPad shows the camera sideways | none | `.none` (default; connection pinned to 0°, compositor rotates) or `.horizonLevelCapture` (gravity-level, physically rotated buffers); angle reported at discovery and on change |
 | Error surface | log lines only; `EnhancedCaptureError` never thrown | `CaptureError` enum, thrown | `didEncounterError` delegate + `sourceStateDidChange` |
 | Permissions | camera at init, screen recording (result discarded) | actor with cache, mic/camera/screen | + microphone (only when audio enabled), screen result reported truthfully |
-| Multi-camera | no | `AVCaptureMultiCamSession` (no hardware-cost guard) | no — see follow-ups |
+| Multi-camera | no | `AVCaptureMultiCamSession` (no hardware-cost guard) | `multiCameraEnabled` → `AVCaptureMultiCamSession` with multi-cam-only formats, hardware/system-pressure budget check, system pressure reporting (2.0.0) |
 | Encoders, file output, streaming, presets, adaptive quality | no | yes | no — out of scope for a texture pipeline |
-| Test pattern / colour / black sources | no | yes (`Data`-based, drifting timer) | no — see follow-ups |
-| Concurrency model | delegate + `AVCaptureSession` subclass, main-actor discovery, lock-guarded hot path | actors + `AsyncStream` (unbounded buffering everywhere) | unchanged |
+| Test pattern / colour / black sources | no | yes (`Data`-based, drifting timer) | `.testPattern` source: pool-backed BGRA or 420v/420f, strict timer, host-clock PTS, frame counter; runs on the Simulator (2.0.0) |
+| Concurrency model | delegate + `AVCaptureSession` subclass, main-actor discovery, lock-guarded hot path | actors + `AsyncStream` (unbounded buffering everywhere) | delegate kept; `EnhancedCaptureStreams` façade adds `AsyncStream`s with newest-frame buffering; kit now *owns* its session (2.0.0) |
 | Platforms | macOS 15 / iOS 16 (17 at runtime) / tvOS 18 | macOS 14 / iOS 17 / visionOS 1 | unchanged |
 
 ## What changed in EnhancedCaptureKit
@@ -192,16 +192,43 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
 - Not exercised on hardware in this pass: microphone delivery, HDMI-card audio, iPad
   rotation and interruption paths. These are the first things to try on the iPad Pro.
 
-## Follow-ups
+## 2.0.0 — follow-ups delivered
 
-- **Multi-camera** (front + back, or camera + UVC on iPad): `AVCaptureMultiCamSession`
-  with manual connections — the pattern we already use — plus a `hardwareCost` guard.
-- **NV12 in `TextureConverter`**: two-plane `CVMetalTextureCache` textures and a
-  YCbCr→RGB shader would halve capture bandwidth on iPad.
-- **Synthetic test source**: SMPTE bars / colour / black into a Metal-compatible
-  `CVPixelBufferPool`, paced by `DispatchSourceTimer` with deadline correction, stamped
-  from the host clock — lets the compositor be tested without hardware.
-- **Async façade**: `AsyncStream` wrappers over the delegate for SwiftUI consumers.
-- **Depth / LiDAR** delivery (`AVCaptureDepthDataOutput`) if the iPad app wants it.
-- **ReplayKit** in-app screen capture on iOS (low priority; unusual for a compositor app).
-- **Privacy manifest** if any required-reason APIs are added.
+The follow-ups listed by the 1.3.x analysis were implemented in priority order.
+
+1. **Multi-camera.** `configuration.multiCameraEnabled` runs an `AVCaptureMultiCamSession`
+   on capable iPads / iPhones so front and back cameras can be enabled together. Formats
+   are restricted to `isMultiCamSupported` (the configured preference or 1080p30); after
+   each camera is added the session's `hardwareCost` / `systemPressureCost` are checked
+   and the camera is removed again with `.multiCameraHardwareCostExceeded` if over budget.
+   Cameras' `systemPressureState` is reported as `.systemPressureElevated`.
+   **Breaking:** to allow the session class to vary, `EnhancedCaptureKit` no longer
+   subclasses `AVCaptureSession`; it owns one at `kit.session` (`isRunning` is forwarded).
+2. **NV12 in the Metal pipeline.** `YCbCrTextureConverter` (ShaderKit) turns 420v / 420f
+   frames into BGRA with one compute dispatch (BT.709 / 601 / 2020 from the buffer's
+   attachment, video or full range), wrapping both planes zero-copy and writing into a
+   three-deep ring of output textures. `TextureConverter` and
+   `TextureCompositorEngine.processIncomingPixelBuffer` use it automatically, so
+   `configuration.pixelFormat = .yCbCr420VideoRange` halves capture bandwidth end to end.
+3. **Synthetic test source.** `configuration.testPatternEnabled` adds a `.testPattern`
+   source: colour bars / grey ramp / checkerboard / solid colour rendered into a
+   Metal-compatible `CVPixelBufferPool` on a strict timer, stamped from the host clock, in
+   BGRA or YCbCr. A moving bar and a 16-square binary frame counter make drops and
+   latency visible. Works on the iOS Simulator, which has no camera.
+4. **Async façade.** `EnhancedCaptureStreams` owns a kit and exposes `sources`, `events`,
+   `audioLevels`, `videoFrames(for:)`, `audioBuffers(for:)` and `depthFrames(for:)` as
+   `AsyncStream`s. Video and depth keep only the newest frame per subscription; audio and
+   events keep bounded windows. Frames remain `CMSampleBuffer`s.
+5. **Depth / LiDAR.** `configuration.depthDataEnabled` attaches an
+   `AVCaptureDepthDataOutput` to cameras with a depth sensor, prefers depth-capable video
+   formats, picks the largest float16 depth format, and delivers `AVDepthData` through
+   `enhancedCaptureDidOutputDepthData(depthData:timestamp:source:)`; such sources carry
+   `.depth` in `media`.
+
+Not done: **ReplayKit** in-app screen capture on iOS (an app compositing live sources has
+little use for recording its own screen; add if a need appears) and a **privacy manifest**
+(no required-reason APIs are used).
+
+All of the above is compile-checked on macOS, iOS and tvOS and unit-tested where hardware
+is not needed (format selection, pattern rendering, GPU YCbCr conversion, stream fan-out).
+Multi-camera, depth and real-camera YCbCr paths still await a run on the iPad Pro.

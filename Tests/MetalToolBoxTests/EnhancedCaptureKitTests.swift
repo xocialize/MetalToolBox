@@ -446,3 +446,48 @@ final class EnhancedCaptureTestPatternTests: XCTestCase {
         CVPixelBufferUnlockBaseAddress(image, .readOnly)
     }
 }
+
+final class EnhancedCaptureDepthTests: XCTestCase {
+
+    private func candidate(_ w: Int32, _ h: Int32, fps: Double, depth: Bool) -> EnhancedCaptureFormatCandidate {
+        EnhancedCaptureFormatCandidate(width: w, height: h, frameRateRanges: [1...fps], supportsDepth: depth)
+    }
+
+    /// LiDAR iPad Pro back camera: only some formats carry depth.
+    private var formats: [EnhancedCaptureFormatCandidate] {
+        [
+            candidate(1280, 720, fps: 30, depth: true),
+            candidate(1920, 1080, fps: 30, depth: true),
+            candidate(1920, 1080, fps: 60, depth: false),
+            candidate(3840, 2160, fps: 30, depth: false),
+        ]
+    }
+
+    func testDepthPreferenceKeepsDepthCapableFormatsWhenAvailable() {
+        let index = EnhancedCaptureFormatSelector.bestIndex(among: formats, preference: .uhd4K30, preferDepthSupport: true)
+        XCTAssertEqual(index, 1, "4K has no depth; the largest depth-capable format wins")
+        XCTAssertTrue(formats[index!].supportsDepth)
+    }
+
+    func testDepthPreferenceIsOptional() {
+        let noDepth = formats.filter { !$0.supportsDepth }
+        let index = EnhancedCaptureFormatSelector.bestIndex(among: noDepth, preference: .uhd4K30, preferDepthSupport: true)
+        XCTAssertNotNil(index, "a camera without depth still gets a format")
+    }
+
+    func testWithoutDepthPreferenceTheBestFormatIsUnchanged() {
+        XCTAssertEqual(EnhancedCaptureFormatSelector.bestIndex(among: formats, preference: .uhd4K30), 3)
+    }
+
+    func testDepthIsOffByDefaultAndMediaFlagExists() {
+        let config = EnhancedCaptureConfiguration.default
+        XCTAssertFalse(config.depthDataEnabled)
+        XCTAssertTrue(config.depthDataFiltered)
+
+        let lidar = EnhancedCaptureSource(id: "l", type: .cameraBack, displayName: "Back", manufacturer: "Apple Inc.", modelID: "x", uniqueID: "l", media: [.video, .depth])
+        XCTAssertTrue(lidar.hasVideo)
+        XCTAssertTrue(lidar.hasDepth)
+        XCTAssertFalse(lidar.hasAudio)
+        XCTAssertNotEqual(EnhancedCaptureMediaKinds.depth, .audio)
+    }
+}
