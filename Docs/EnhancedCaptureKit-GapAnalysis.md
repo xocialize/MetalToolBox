@@ -28,8 +28,8 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
 | iOS device over USB (macOS, CoreMediaIO) | yes | no | unchanged |
 | Display capture (macOS, ScreenCaptureKit) | yes, 30 fps, cursor on, all frames forwarded | display/window/app/region | + configurable fps & cursor, only `.complete` frames forwarded, **system audio** |
 | **Microphone capture (iOS/macOS)** | **none** | `AVAudioEngine` tap → interleaved Float32 `Data` | **`AVCaptureAudioDataOutput` on the shared session → `CMSampleBuffer`**, mic sources discovered as `.microphone` |
-| **Muxed device audio (HDMI card embedded audio)** | macOS: speaker preview only; iOS: nothing | not modelled (audio and video are separate sources) | **sample buffers on both platforms** + optional macOS speaker preview |
-| System audio (macOS) | none | `SystemAudioSource` (SCStream) | on the screen source when `screenAudioEnabled` |
+| **Muxed device audio (HDMI card embedded audio)** | macOS: speaker preview only; iOS: nothing | not modelled (audio and video are separate sources) | **sample buffers on both platforms** + macOS speaker preview (kept on by default, independent of `audioEnabled`) |
+| System audio (macOS) | none | `SystemAudioSource` (SCStream) | on the screen source when `screenAudioEnabled` (needs no microphone permission) |
 | Audio levels | none | scalar peak/RMS; EBU R128 fields are placeholders (RMS − 0.691) | AVFoundation `AVCaptureAudioChannel` peak/average per channel, throttled |
 | `AVAudioSession` handling (iOS) | none | sets `.playAndRecord/.measurement` unconditionally | policy: automatic / applicationManaged / detached; preferred-input helpers |
 | Format / frame-rate selection | picked widest format, then `.high` preset overrode it on iOS | first format matching fps (no resolution match) | `EnhancedCaptureVideoPreference` → scored selection, `.inputPriority` on iOS/tvOS, re-applied after input joins |
@@ -37,7 +37,7 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
 | Session interruptions (iOS) | none (`.interrupted` state existed but was never set) | none | `wasInterrupted` / `interruptionEnded` → delegate + per-source state |
 | Runtime errors / media-services reset | none | none | reported; auto-restart on `AVErrorMediaServicesWereReset` |
 | iPad multitasking camera access (Split View, Stage Manager) | none | none | enabled when entitled (`isMultitaskingCameraAccessSupported`) |
-| Camera rotation (iOS 17 `RotationCoordinator`) | none — portrait iPad shows the camera sideways | none | horizon-level preview/capture modes applied to the video connection; angle reported |
+| Camera rotation (iOS 17 `RotationCoordinator`) | none — portrait iPad shows the camera sideways | none | `.none` (default; connection pinned to 0°, compositor rotates) or `.horizonLevelCapture` (gravity-level, physically rotated buffers); angle reported at discovery and on change |
 | Error surface | log lines only; `EnhancedCaptureError` never thrown | `CaptureError` enum, thrown | `didEncounterError` delegate + `sourceStateDidChange` |
 | Permissions | camera at init, screen recording (result discarded) | actor with cache, mic/camera/screen | + microphone (only when audio enabled), screen result reported truthfully |
 | Multi-camera | no | `AVCaptureMultiCamSession` (no hardware-cost guard) | no — see follow-ups |
@@ -51,8 +51,9 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
 ### New public API
 
 - `EnhancedCaptureConfiguration` and `init(delegate:configuration:)`. `init(delegate:)`
-  uses `.default`, which reproduces the previous behaviour exactly: audio off, BGRA,
-  no format preference, macOS speaker preview on.
+  uses `.default`, which reproduces the previous behaviour — audio off, BGRA, no format
+  preference, sensor-oriented camera buffers, macOS speaker preview on — apart from
+  the additions listed under "Behaviour changes" below.
 - `EnhancedCaptureSourceType.microphone`; `EnhancedCaptureSource.media` / `hasAudio` /
   `hasVideo`. A muxed HDMI card is `[.video, .audio]`.
 - Delegate methods, all with default no-op implementations:
@@ -80,9 +81,34 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
 
 ### Behaviour changes
 
-- **macOS default format**: previously "widest format", now "largest area" (same result
-  for every real device list, but not identical by definition). Set
-  `configuration.videoPreference` for anything else.
+- **macOS default format**: previously "first widest format", now "largest area, then
+  non-binned, then highest frame rate, then device order". Usually the same format;
+  a device listing several equal-size formats (e.g. uncompressed@5 fps and MJPEG@30 fps)
+  now gets the faster one. Set `configuration.videoPreference` for anything else.
+- **Camera rotation (iOS 17+)**: `cameraRotationMode` defaults to `.none`, which now
+  pins the video connection to 0° — Spring-2024 and later iPads otherwise default the
+  front camera's data output to 180°. The `.horizonLevelCapture` mode physically
+  rotates buffers (AVFoundation re-configures the pipeline on each orientation
+  change). There is no "horizon-level preview" mode: `AVCaptureDevice.RotationCoordinator`
+  only computes that angle for a `CALayer` in a view hierarchy, which the kit does not
+  own; rotate in the compositor instead.
+- **Audio preview (macOS)** stays on by default and is independent of `audioEnabled`
+  and of microphone permission, as before — but it now applies only to devices with
+  video (muxed capture cards). A microphone source never gets a speaker preview.
+- **Audio permission timing**: a source enabled while the microphone prompt is still
+  pending is not refused; its audio (or, for a microphone source, the whole source)
+  is attached when the permission resolves. Microphone status is read live at enable
+  time, not cached from the init-time check. If the camera is denied but the
+  microphone granted, the session is started for audio anyway.
+- **Multitasking camera access (iPad)** is enabled by default when the app is entitled
+  (`multitaskingCameraAccessEnabled`); previously the kit never touched it.
+- **Media-services reset** now restarts the session automatically
+  (`restartsAfterMediaServicesReset`); previously there was no runtime-error observer.
+- **Format preference on iOS / tvOS** is applied once, inside the session's
+  configuration block after the input joins (`.inputPriority`), not at discovery.
+- **Frame-rate lock** keeps fractional rates (29.97 / 59.94) and clamps into the
+  format's reported range; rounding to an integer timescale produced a duration
+  AVFoundation rejects with an uncatchable exception.
 - **iOS format**: previously the widest format was set and then silently discarded when
   the `.high` preset took over. Now the format is untouched unless a preference is set,
   in which case `.inputPriority` is used and the preference is re-applied after the input
@@ -147,9 +173,10 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
 4. **External USB-C devices**: UVC cameras/capture cards appear as `.externalDevice`;
    USB audio interfaces do not appear as separate sources on iPadOS — route the single
    `.microphone` source with `setPreferredAudioInput(_:)`.
-5. **Rotation**: `.horizonLevelPreview` (default) makes frames upright on the iPad's own
-   screen; use `.horizonLevelCapture` when sending frames off-device; `.none` if the
-   compositor rotates.
+5. **Rotation**: `.none` (default) delivers sensor-oriented buffers with the connection
+   pinned to 0°; rotate in the compositor using the angle from
+   `videoRotationAngleDidChange` or the interface orientation. `.horizonLevelCapture`
+   is for frames that leave the device (gravity-level, physically rotated).
 6. **Format**: set `videoPreference = .hd1080p30` (or `.hd1080p60`) — without it the
    `.high` preset decides, and with the old code the widest (photo) format would have been
    requested.

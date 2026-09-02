@@ -72,16 +72,23 @@ public enum EnhancedCaptureAudioSessionPolicy: Sendable, Hashable {
 ///
 /// Camera buffers arrive in sensor orientation (landscape, home-button right).
 /// Without rotation a portrait iPad shows the camera sideways.
+///
+/// There is no interface-orientation ("horizon-level preview") mode:
+/// `AVCaptureDevice.RotationCoordinator` only computes that angle for a
+/// `CALayer` that is in a view hierarchy, and the kit owns no such layer.
+/// Rotating in the compositor is free and is the recommended path for a
+/// texture pipeline; `.horizonLevelCapture` exists for frames that leave
+/// the device.
 public enum EnhancedCaptureRotationMode: Sendable, Hashable {
     /// Deliver sensor-oriented buffers; the compositor applies any rotation.
+    /// The video connection is pinned to 0° (Spring-2024 and later iPads
+    /// default the front camera's data output to 180° otherwise).
     case none
-
-    /// Follow the interface orientation so frames are upright when shown on
-    /// the device's own display (`videoRotationAngleForHorizonLevelPreview`).
-    case horizonLevelPreview
 
     /// Follow gravity so frames are upright relative to the real horizon
     /// regardless of UI orientation (`videoRotationAngleForHorizonLevelCapture`).
+    /// AVFoundation physically rotates every buffer, so this costs a render
+    /// pass per frame and re-configures the pipeline on each orientation change.
     /// Right for recording or sending frames off-device.
     case horizonLevelCapture
 }
@@ -93,18 +100,26 @@ public struct EnhancedCaptureConfiguration: Sendable, Equatable {
 
     // MARK: Audio
 
-    /// Discover microphones and connect the audio ports of muxed devices
-    /// (HDMI capture cards). Requires `NSMicrophoneUsageDescription`; the kit
-    /// requests microphone permission during initialisation when this is on.
+    /// Discover microphones and capture the audio ports of muxed devices
+    /// (HDMI capture cards) as sample buffers / levels. Requires
+    /// `NSMicrophoneUsageDescription`; the kit requests microphone permission
+    /// during initialisation when this is on. Does not affect the macOS
+    /// speaker preview (`audioPreviewEnabled`) or display system audio
+    /// (`screenAudioEnabled`).
     public var audioEnabled: Bool = false
 
-    /// Deliver audio sample buffers to
+    /// Deliver audio sample buffers (device and display audio) to
     /// `EnhancedCaptureDelegate.enhancedCaptureDidOutputAudioSampleBuffer(sampleBuffer:source:)`.
+    /// With this off and `audioLevelMeteringEnabled` on, device audio is still
+    /// captured for metering but no buffers reach the delegate.
     public var deliversAudioSampleBuffers: Bool = true
 
-    /// macOS only: play captured device audio through the default output via
-    /// `AVCaptureAudioPreviewOutput`. Historical signage behaviour — on before
-    /// this configuration existed, so it stays on by default on macOS.
+    /// macOS only: play a muxed device's embedded audio (HDMI capture card)
+    /// through the default output via `AVCaptureAudioPreviewOutput`.
+    /// Independent of `audioEnabled` and of microphone permission, and never
+    /// applied to microphone sources (that would feed the mic to the speakers).
+    /// Historical signage behaviour — on before this configuration existed,
+    /// so it stays on by default on macOS.
     public var audioPreviewEnabled: Bool = {
         #if os(macOS)
         return true
@@ -116,16 +131,20 @@ public struct EnhancedCaptureConfiguration: Sendable, Equatable {
     /// Volume for the macOS audio preview output (0…1).
     public var audioPreviewVolume: Float = 1.0
 
-    /// Report per-channel peak / average levels through
+    /// Report per-channel peak / average levels of device sources through
     /// `EnhancedCaptureDelegate.enhancedCapture(_:didUpdateAudioLevel:for:)`.
-    /// Uses AVFoundation's own channel metering, so it costs nothing extra.
+    /// Uses AVFoundation's own channel metering on the audio data output, so it
+    /// costs nothing extra. Requires `audioEnabled`. Display (ScreenCaptureKit)
+    /// audio has no meters.
     public var audioLevelMeteringEnabled: Bool = false
 
     /// Minimum spacing between audio level callbacks, in seconds.
     public var audioLevelInterval: TimeInterval = 0.05
 
     /// macOS only: include system audio when capturing a display via
-    /// ScreenCaptureKit. The current process is always excluded.
+    /// ScreenCaptureKit. The current process is always excluded. Governed by
+    /// Screen Recording permission, not the microphone: it does not need
+    /// `audioEnabled`. Delivered only when `deliversAudioSampleBuffers` is on.
     public var screenAudioEnabled: Bool = false
 
     /// iOS / tvOS: ownership of `AVAudioSession` while capturing.
@@ -155,16 +174,19 @@ public struct EnhancedCaptureConfiguration: Sendable, Equatable {
     /// entitlement or the `voip` background mode.
     public var multitaskingCameraAccessEnabled: Bool = true
 
-    /// Rotation applied to built-in camera frames on iOS.
-    public var cameraRotationMode: EnhancedCaptureRotationMode = .horizonLevelPreview
+    /// Rotation applied to built-in camera frames on iOS. `.none` delivers
+    /// sensor-oriented buffers (the pre-configuration behaviour); the compositor
+    /// rotates for free.
+    public var cameraRotationMode: EnhancedCaptureRotationMode = .none
 
     /// Restart the session automatically after `AVError.mediaServicesWereReset`.
     public var restartsAfterMediaServicesReset: Bool = true
 
     public init() {}
 
-    /// Everything off except video — identical to the kit's behaviour before
-    /// this type existed.
+    /// Everything off except video and the macOS speaker preview — identical to
+    /// the kit's behaviour before this type existed, apart from the additions
+    /// recorded under "Behaviour changes" in `Docs/EnhancedCaptureKit-GapAnalysis.md`.
     public static let `default` = EnhancedCaptureConfiguration()
 
     /// Audio on with sample-buffer delivery and level metering; macOS audio

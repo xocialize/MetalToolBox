@@ -84,6 +84,21 @@ enum EnhancedCaptureFormatSelector {
             return lhs < rhs
         }
     }
+
+    /// The frame duration for `fps`, kept fractional — `1000 / round(fps × 1000)`
+    /// — so 59.94 stays 59.94 rather than rounding to 60. `nil` for a rate that
+    /// is not a positive finite number representable in a `CMTimeScale`.
+    ///
+    /// Rounding to an integer timescale is not merely imprecise: 1/60 s is
+    /// shorter than a 59.94 fps format's minimum frame duration, and
+    /// `activeVideoMinFrameDuration` raises `NSInvalidArgumentException` for
+    /// an unsupported value — an ObjC exception Swift cannot catch.
+    static func frameDuration(forFrameRate fps: Double) -> CMTime? {
+        guard fps.isFinite, fps > 0 else { return nil }
+        let scaled = (fps * 1000).rounded()
+        guard scaled >= 1, scaled <= Double(Int32.max) else { return nil }
+        return CMTime(value: 1000, timescale: CMTimeScale(scaled))
+    }
 }
 
 // MARK: - AVFoundation glue
@@ -124,8 +139,14 @@ extension AVCaptureDevice {
         defer { unlockForConfiguration() }
 
         activeFormat = format
-        if let fps = preference.preferredFrameRate, candidate.supports(frameRate: fps) {
-            let duration = CMTime(value: 1, timescale: CMTimeScale(fps.rounded()))
+        if let fps = preference.preferredFrameRate,
+           let range = format.videoSupportedFrameRateRanges.first(where: { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }),
+           let requested = EnhancedCaptureFormatSelector.frameDuration(forFrameRate: fps) {
+            // Clamp into the range AVFoundation reported so the value is always
+            // one the setter accepts (see `frameDuration(forFrameRate:)`).
+            var duration = requested
+            if duration < range.minFrameDuration { duration = range.minFrameDuration }
+            if duration > range.maxFrameDuration { duration = range.maxFrameDuration }
             activeVideoMinFrameDuration = duration
             activeVideoMaxFrameDuration = duration
         }

@@ -34,20 +34,18 @@ class PermissionManager: @unchecked Sendable {
 
     // MARK: - Synchronous status
 
-    /// Current status without prompting.
+    /// Current status without prompting. The kit consults this at enable time
+    /// rather than caching a resolution, so a grant that arrives later (or a
+    /// System Settings change while running) is seen immediately.
     static func currentStatus(for type: PermissionType) -> PermissionStatus {
-        switch type {
-        case .camera:
-            return map(AVCaptureDevice.authorizationStatus(for: .video))
-        case .microphone:
-            return map(AVCaptureDevice.authorizationStatus(for: .audio))
-        case .screenRecording:
-            #if os(macOS)
-            return CGPreflightScreenCaptureAccess() ? .authorized : .notDetermined
-            #else
-            return .restricted
-            #endif
+        if let mediaType = type.avMediaType {
+            return map(AVCaptureDevice.authorizationStatus(for: mediaType))
         }
+        #if os(macOS)
+        return CGPreflightScreenCaptureAccess() ? .authorized : .notDetermined
+        #else
+        return .restricted
+        #endif
     }
 
     private static func map(_ status: AVAuthorizationStatus) -> PermissionStatus {
@@ -68,9 +66,9 @@ class PermissionManager: @unchecked Sendable {
     /// on the main queue.
     func checkPermissions(includeMicrophone: Bool) {
         mlog.debug("Checking permissions (microphone: \(includeMicrophone))")
-        checkAVPermission(.camera, mediaType: .video)
+        checkAVPermission(.camera)
         if includeMicrophone {
-            checkAVPermission(.microphone, mediaType: .audio)
+            checkAVPermission(.microphone)
         }
 
         #if os(macOS)
@@ -78,13 +76,9 @@ class PermissionManager: @unchecked Sendable {
         #endif
     }
 
-    /// Checks (and if needed requests) microphone access on its own.
-    func checkMicrophonePermission() {
-        checkAVPermission(.microphone, mediaType: .audio)
-    }
-
-    private func checkAVPermission(_ type: PermissionType, mediaType: AVMediaType) {
-        let status = Self.map(AVCaptureDevice.authorizationStatus(for: mediaType))
+    private func checkAVPermission(_ type: PermissionType) {
+        guard let mediaType = type.avMediaType else { return }
+        let status = Self.currentStatus(for: type)
 
         switch status {
         case .authorized:
@@ -128,4 +122,16 @@ class PermissionManager: @unchecked Sendable {
         }
     }
     #endif
+}
+
+extension PermissionType {
+    /// The AVFoundation media type this permission governs; `nil` for screen
+    /// recording, which TCC handles outside AVFoundation.
+    var avMediaType: AVMediaType? {
+        switch self {
+        case .camera:          return .video
+        case .microphone:      return .audio
+        case .screenRecording: return nil
+        }
+    }
 }

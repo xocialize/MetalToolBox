@@ -74,10 +74,10 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     #endif
     private(set) var videoPreviewConnectionActive: Bool = false
 
-    /// The device exposes a video port (camera, capture card, iOS device).
+    /// The device's input opened with a video port (camera, capture card, iOS
+    /// device). Port-based: false when the input could not be opened. Use
+    /// `captureSource.hasVideo` for what the device *is*.
     var hasVideo: Bool { videoPort != nil }
-    /// The device exposes an audio port (microphone, muxed capture card).
-    var hasAudio: Bool { audioPort != nil }
 
     // MARK: - Device Properties
 
@@ -89,18 +89,19 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     nonisolated(unsafe) private var lastAudioLevelTime: CMTime = .invalid
 
     #if os(iOS)
-    @available(iOS 17.0, *)
-    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator? {
-        get { _rotationCoordinator as? AVCaptureDevice.RotationCoordinator }
-        set { _rotationCoordinator = newValue }
-    }
-    private var _rotationCoordinator: AnyObject?
+    // `AVCaptureDevice.RotationCoordinator` is iOS 17+ and stored properties
+    // cannot carry availability, so the reference is erased; only the KVO
+    // closure (which receives the typed coordinator) ever reads it.
+    private var rotationCoordinator: AnyObject?
     private var rotationObservation: NSKeyValueObservation?
+    /// Angle currently applied to the video connection, so the kit can report
+    /// it once the device is registered (the first KVO fires during `init`).
+    private(set) var videoRotationAngle: CGFloat?
     #endif
 
     // MARK: - Initialization
 
-    init(device: AVCaptureDevice, delegate: EnhancedCaptureDeviceDelegate, configuration: EnhancedCaptureConfiguration = .default) {
+    init(device: AVCaptureDevice, delegate: EnhancedCaptureDeviceDelegate, configuration: EnhancedCaptureConfiguration) {
         self.device = device
         self.delegate = delegate
         self.configuration = configuration
@@ -122,10 +123,17 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     // MARK: - Private Helpers
 
     private func createCaptureSource(from device: AVCaptureDevice) -> EnhancedCaptureSource {
+        // Classify by what the device *is*, not by which ports opened: an input
+        // that fails to open (camera permission denied, device held by another
+        // app) must still be listed as the camera it is, so that enabling it
+        // fails honestly instead of advertising a phantom microphone.
+        let videoCapable = device.hasMediaType(.video) || device.hasMediaType(.muxed)
+        let audioCapable = device.hasMediaType(.audio) || device.hasMediaType(.muxed)
+
         // Determine the source type based on device characteristics
         let sourceType: EnhancedCaptureSourceType
 
-        if !hasVideo {
+        if !videoCapable {
             sourceType = .microphone
         } else {
             #if os(macOS)
@@ -161,8 +169,8 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         #endif
 
         var media = EnhancedCaptureMediaKinds()
-        if hasVideo { media.insert(.video) }
-        if hasAudio && configuration.audioEnabled { media.insert(.audio) }
+        if videoCapable { media.insert(.video) }
+        if audioCapable && configuration.audioEnabled { media.insert(.audio) }
 
         // Create the capture source
         return EnhancedCaptureSource(
@@ -214,21 +222,19 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         return connection
     }
 
-    /// Applies the configured video preference.
+    /// Applies the configured video preference (macOS only).
     ///
     /// Without a preference, macOS keeps the historical behaviour of selecting
     /// the device's largest format (macOS honours a format set before the
-    /// input joins the session). iOS / tvOS leave the format alone so the
-    /// `.high` preset governs — there, a format set here would be reset the
-    /// moment the input is added anyway; see ``reapplyVideoPreference()``.
+    /// input joins the session). iOS / tvOS are left alone here: a format set
+    /// now would be reset the moment the input is added, so the preference is
+    /// applied once, inside the session's configuration block, by
+    /// ``reapplyVideoPreference()``; without a preference the `.high` preset governs.
     private func setupDevice() {
         guard hasVideo else { return }
         #if os(macOS)
-        let preference = configuration.videoPreference ?? EnhancedCaptureVideoPreference()
-        #else
-        guard let preference = configuration.videoPreference else { return }
+        apply(configuration.videoPreference ?? EnhancedCaptureVideoPreference())
         #endif
-        apply(preference)
     }
 
     /// iOS / tvOS reset `activeFormat` and the frame-duration lock when an
@@ -335,26 +341,32 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         mlog.debug("Video connection configured")
     }
 
-    /// Audio wiring. Sample-buffer delivery goes through an
+    /// Audio wiring. Sample-buffer delivery and level metering share an
     /// `AVCaptureAudioDataOutput` on its own queue so audio callbacks never
     /// wait behind video frames; the macOS speaker preview is a second output
     /// on the same port.
     private func setupAudio() {
-        guard let audioPort = audioPort, configuration.audioEnabled else {
-            if audioPort != nil { mlog.debug("Audio port present but audio capture is disabled") }
-            return
-        }
+        guard let audioPort = audioPort else { return }
 
-        if configuration.deliversAudioSampleBuffers {
+        // Capture (buffers and/or meters) needs the microphone entitlement, so
+        // it rides on `audioEnabled`. Metering alone still needs the output.
+        if configuration.audioEnabled,
+           configuration.deliversAudioSampleBuffers || configuration.audioLevelMeteringEnabled {
             let output = AVCaptureAudioDataOutput()
             output.setSampleBufferDelegate(self, queue: audioQueue)
             dataAudioOutput = output
             audioConnection = AVCaptureConnection(inputPorts: [audioPort], output: output)
             mlog.debug("Audio data connection configured")
+        } else {
+            mlog.debug("Audio port present but audio capture is disabled")
         }
 
         #if os(macOS)
-        if configuration.audioPreviewEnabled {
+        // Speaker preview of a muxed device's embedded audio (HDMI card). It is
+        // not capture: independent of `audioEnabled` and of the microphone
+        // permission, exactly as before the configuration existed — and never
+        // for a microphone, which would feed the mic back to the speakers.
+        if configuration.audioPreviewEnabled, hasVideo {
             let preview = AVCaptureAudioPreviewOutput()
             preview.volume = configuration.audioPreviewVolume
             audioPreview = preview
@@ -367,28 +379,31 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
     // MARK: - Rotation (iOS / iPadOS)
 
     #if os(iOS)
-    /// Built-in cameras deliver sensor-oriented buffers. The rotation
-    /// coordinator tracks the angle that makes them upright and the video
-    /// connection applies it before delivery.
+    /// Built-in cameras deliver sensor-oriented buffers. `.none` pins the
+    /// connection to 0° (newer iPads default the front camera's data output to
+    /// 180°); `.horizonLevelCapture` lets a rotation coordinator track the
+    /// gravity-level angle and applies it before delivery.
+    ///
+    /// The first KVO callback fires synchronously in here, before the kit has
+    /// registered this device, so the kit replays `videoRotationAngle` after
+    /// registration.
     private func setupRotationCoordinator() {
-        guard hasVideo,
-              device.position != .unspecified,
-              configuration.cameraRotationMode != .none,
-              #available(iOS 17.0, *) else { return }
+        guard hasVideo, device.position != .unspecified, #available(iOS 17.0, *) else { return }
 
-        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
-        rotationCoordinator = coordinator
-
-        let keyPath: KeyPath<AVCaptureDevice.RotationCoordinator, CGFloat>
         switch configuration.cameraRotationMode {
-        case .horizonLevelCapture: keyPath = \.videoRotationAngleForHorizonLevelCapture
-        case .horizonLevelPreview, .none: keyPath = \.videoRotationAngleForHorizonLevelPreview
-        }
+        case .none:
+            applyRotationAngle(0)
 
-        rotationObservation = coordinator.observe(keyPath, options: [.initial, .new]) { [weak self] coordinator, _ in
-            self?.applyRotationAngle(coordinator[keyPath: keyPath])
+        case .horizonLevelCapture:
+            let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+            rotationCoordinator = coordinator
+            rotationObservation = coordinator.observe(
+                \.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]
+            ) { [weak self] coordinator, _ in
+                self?.applyRotationAngle(coordinator.videoRotationAngleForHorizonLevelCapture)
+            }
+            mlog.debug("Rotation coordinator active for \(self.device.localizedName)")
         }
-        mlog.debug("Rotation coordinator active for \(self.device.localizedName)")
     }
 
     private func applyRotationAngle(_ angle: CGFloat) {
@@ -396,6 +411,7 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         if #available(iOS 17.0, *), connection.isVideoRotationAngleSupported(angle) {
             connection.videoRotationAngle = angle
         }
+        videoRotationAngle = angle
         delegate?.deviceVideoRotationAngleDidChange(angle, uniqueID: device.uniqueID)
     }
     #endif
@@ -428,19 +444,31 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
 
     /// Focuses (and exposes, when supported) at a point in normalized
     /// sensor coordinates: (0,0) top-left, (1,1) bottom-right, landscape.
+    ///
+    /// Prefers the continuous modes: the one-shot `.autoFocus` / `.autoExpose`
+    /// modes transition to `.locked` after the scan, which would freeze focus
+    /// and exposure at this point for the life of the device.
     func setFocusAndExposurePoint(_ point: CGPoint) throws {
         guard device.isFocusPointOfInterestSupported || device.isExposurePointOfInterestSupported else {
             throw EnhancedCaptureError.deviceConfigurationFailed(reason: "point of interest unsupported on \(device.localizedName)")
         }
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
-        if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.autoFocus) {
+        if device.isFocusPointOfInterestSupported {
             device.focusPointOfInterest = point
-            device.focusMode = .autoFocus
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
+            }
         }
-        if device.isExposurePointOfInterestSupported, device.isExposureModeSupported(.autoExpose) {
+        if device.isExposurePointOfInterestSupported {
             device.exposurePointOfInterest = point
-            device.exposureMode = .autoExpose
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            } else if device.isExposureModeSupported(.autoExpose) {
+                device.exposureMode = .autoExpose
+            }
         }
     }
 
@@ -473,7 +501,7 @@ class EnhancedCaptureDevice: NSObject, @unchecked Sendable {
         audioPreview = nil
         #endif
         #if os(iOS)
-        _rotationCoordinator = nil
+        rotationCoordinator = nil
         #endif
         input = nil
         audioPort = nil
@@ -495,7 +523,9 @@ extension EnhancedCaptureDevice: AVCaptureVideoDataOutputSampleBufferDelegate, A
                 uniqueID: device.uniqueID
             )
         } else if connection === audioConnection {
-            delegate?.deviceAudioBuffer(sampleBuffer: sampleBuffer, uniqueID: device.uniqueID)
+            if configuration.deliversAudioSampleBuffers {
+                delegate?.deviceAudioBuffer(sampleBuffer: sampleBuffer, uniqueID: device.uniqueID)
+            }
             if configuration.audioLevelMeteringEnabled {
                 emitAudioLevelIfDue(connection: connection, sampleBuffer: sampleBuffer)
             }

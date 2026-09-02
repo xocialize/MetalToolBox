@@ -84,6 +84,23 @@ final class EnhancedCaptureFormatSelectorTests: XCTestCase {
         XCTAssertEqual(iPadFormats[index!].maxFrameRate, 60, "same size: higher max fps wins")
     }
 
+    func testFrameDurationKeepsFractionalRates() {
+        // 59.94 must not round to 1/60: that is shorter than a 59.94 fps
+        // format's minimum frame duration and the AVFoundation setter throws.
+        let ntsc = EnhancedCaptureFormatSelector.frameDuration(forFrameRate: 59.94)
+        XCTAssertNotNil(ntsc)
+        XCTAssertEqual(ntsc!.value, 1000)
+        XCTAssertEqual(ntsc!.timescale, 59_940)
+        XCTAssertGreaterThanOrEqual(ntsc!, CMTime(value: 1001, timescale: 60_000), "must be a legal duration for a 60000/1001 range")
+        XCTAssertLessThan(ntsc!, CMTime(value: 1, timescale: 59), "and not slower than 59 fps")
+
+        XCTAssertEqual(EnhancedCaptureFormatSelector.frameDuration(forFrameRate: 30), CMTime(value: 1000, timescale: 30_000))
+        XCTAssertEqual(EnhancedCaptureFormatSelector.frameDuration(forFrameRate: 30)!.seconds, 1.0 / 30, accuracy: 1e-9)
+        XCTAssertNil(EnhancedCaptureFormatSelector.frameDuration(forFrameRate: 0))
+        XCTAssertNil(EnhancedCaptureFormatSelector.frameDuration(forFrameRate: -24))
+        XCTAssertNil(EnhancedCaptureFormatSelector.frameDuration(forFrameRate: .infinity))
+    }
+
     func testCandidateHelpers() {
         let c = candidate(1920, 1080, fps: [1...30, 60...60])
         XCTAssertTrue(c.supports(frameRate: 24))
@@ -107,6 +124,8 @@ final class EnhancedCaptureTypesTests: XCTestCase {
         XCTAssertEqual(config.pixelFormat, .bgra)
         XCTAssertEqual(config.screenFrameRate, 30)
         XCTAssertTrue(config.screenShowsCursor)
+        XCTAssertFalse(config.screenAudioEnabled)
+        XCTAssertEqual(config.cameraRotationMode, .none, "buffers were sensor-oriented before configuration existed")
         #if os(macOS)
         XCTAssertTrue(config.audioPreviewEnabled, "macOS speaker preview was always on before configuration existed")
         #else
