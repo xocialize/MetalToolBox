@@ -111,9 +111,39 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
         }
     }
     
-    public var playerIsPause:Bool = false {
-        didSet {}
+    /// Whether playback is HELD on its current frame.
+    ///
+    /// Setting this pauses or resumes the underlying player and touches nothing
+    /// else — not the item, not the section observer, not the last delivered
+    /// pixel buffer. So a render loop reading ``directBufferCheck()`` keeps
+    /// presenting the frame it already has (a natural freeze), and a resume
+    /// continues from exactly where the hold landed: the clock is AVPlayer's,
+    /// so no consumer has to track a position.
+    ///
+    /// This is the opposite of ``stopVideo()``, which tears the item down and
+    /// clears the buffer precisely so a stale frame CANNOT be presented.
+    ///
+    /// ⚠️ Before 2.1.0 this property's observer was empty — setting it flipped
+    /// a flag and nothing else, so a caller believed playback was held while it
+    /// carried on regardless. It is honoured now.
+    public var playerIsPause: Bool = false {
+        didSet {
+            guard playerIsPause != oldValue else { return }
+            if playerIsPause {
+                player.pause()
+            } else if player.currentItem != nil {
+                // Resuming with nothing loaded is not a play; `stopVideo()`
+                // clears the hold on its way out and must not start anything.
+                player.play()
+            }
+        }
     }
+
+    /// Hold playback on the current frame. See ``playerIsPause``.
+    public func pause() { playerIsPause = true }
+
+    /// Continue from exactly where ``pause()`` left off.
+    public func resume() { playerIsPause = false }
 
     public convenience init(delegate: VideoPlayerDelegate, identifier: String) {
         self.init(identifier: identifier)
@@ -187,6 +217,10 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
             }
         }
 
+        // A fresh load is playing by definition: a hold left over from the
+        // previous clip must not silently swallow this one.
+        playerIsPause = false
+
         player.play()
 
 }
@@ -216,7 +250,8 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
         player.seek(to: sectionStartTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             self?.lapSignaled = false
         }
-        player.play()
+        // A lap landing while playback is held must not un-hold it.
+        if !playerIsPause { player.play() }
     }
 
     private func removeSectionEndObserver() {
@@ -245,7 +280,10 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
         player.play()
     }
 
-    public func stopVideo(pausePlayer:Bool = false){
+    /// Tear the current item down: stop, drop the observers, and clear the last
+    /// buffer so a render loop cannot present a stray frame from content that is
+    /// no longer active. To HOLD the current frame instead, use ``pause()``.
+    public func stopVideo(){
         player.pause()
         removeSectionEndObserver()
         lapSignaled = false
@@ -255,7 +293,13 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
             NotificationCenter.default.removeObserver(observer)
             playbackEndObserver = nil
         }
+        // Nothing is loaded, so nothing is held. Assigned last, with the item
+        // already gone, so the observer above cannot start playback.
+        playerIsPause = false
     }
+
+    @available(*, deprecated, message: "`pausePlayer` was never read — this took the same path either way. Use stopVideo() to tear down, or pause() to hold the current frame.")
+    public func stopVideo(pausePlayer: Bool) { stopVideo() }
     
     
     // This could be called from the render loop instead of the direct methods below.
