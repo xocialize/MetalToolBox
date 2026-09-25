@@ -18,8 +18,7 @@ import AVFoundation
 
 final class PausePlaybackTests: XCTestCase, VideoPlayerDelegate {
 
-    private static let fixture = URL(fileURLWithPath:
-        "/Volumes/Satechi/MarqueeProjects/VP26/e0807ae4-b779-4e3d-8cf9-bab12ec5bbe0.mp4")
+    private static let fixture = RealAssetFixture.clip
 
     private var lap: XCTestExpectation?
 

@@ -81,6 +81,39 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
         CMTime(seconds: section.start, preferredTimescale: 600)
     }
 
+    /// What the player does when a section ends. See ``SectionEndAction``.
+    ///
+    /// Belongs to the PLAYER, not the clip: a consumer that sequences clips
+    /// itself sets `.hold` once, and every section it plays then ends on its
+    /// last frame and waits for the next ``play(url:section:)``.
+    public var actionAtSectionEnd: SectionEndAction = .loop
+
+    /// Set when a `.hold` section has ended: the player is stopped on the
+    /// section's last frame, and a resume does not play on past the out-point.
+    /// Cleared by the next load and by ``stopVideo()``.
+    public private(set) var hasFinishedSection = false
+
+    /// How close to the out-point a frame may start and still be refused:
+    /// rounding room for a frame whose time is the out-point itself. Frames are
+    /// at least 8 ms apart even at 120 fps, so no earlier frame can fall inside.
+    static let outPointTolerance: Double = 0.001
+
+    /// Whether audio is muted. Kept across loads: it belongs to the player, not
+    /// the clip, so a preview that starts muted stays muted from clip to clip.
+    public var isMuted: Bool {
+        get { player.isMuted }
+        set { player.isMuted = newValue }
+    }
+
+    /// The playhead in media seconds, on the item's own clock. It holds still
+    /// while playback is held and after a `.hold` section ends. 0 with nothing
+    /// loaded.
+    public var mediaTime: Double {
+        guard player.currentItem != nil else { return 0 }
+        let seconds = player.currentTime().seconds
+        return seconds.isFinite ? seconds : 0
+    }
+
     public var videoUrl: URL?  {
         didSet{
             guard videoUrl != nil else {
@@ -131,9 +164,12 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
             guard playerIsPause != oldValue else { return }
             if playerIsPause {
                 player.pause()
-            } else if player.currentItem != nil {
+            } else if player.currentItem != nil, !hasFinishedSection {
                 // Resuming with nothing loaded is not a play; `stopVideo()`
                 // clears the hold on its way out and must not start anything.
+                // Nor is resuming a `.hold` section that has already ended:
+                // there is nothing left of it, and playing on would run past
+                // the out-point.
                 player.play()
             }
         }
@@ -197,6 +233,7 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
         if playbackEndObserver == nil { installEndObserver() }
         removeSectionEndObserver()
         lapSignaled = false
+        hasFinishedSection = false
 
         let videoItem = AVPlayerItem(url: videoUrl)
 
@@ -242,7 +279,22 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
     /// section's start, keep playing. Both the boundary observer and the
     /// end-of-item notification route here; `lapSignaled` de-duplicates a lap
     /// that both report (a section ending at the file's end).
+    ///
+    /// With `.hold`, the section ends instead: pause where it is and signal
+    /// once. There is no seek, so the last frame the section presented stays
+    /// the last frame (the out-point filter in the buffer checks refuses any
+    /// frame the clock reached past it). A `.loop` lap has already sought back
+    /// to the start by the time a delegate that pauses asynchronously gets to
+    /// run, which is why a sequencer that holds at a boundary needs `.hold`.
     private func completeLap() {
+        if actionAtSectionEnd == .hold {
+            guard !hasFinishedSection else { return }
+            hasFinishedSection = true
+            lapSignaled = true
+            player.pause()
+            delegate?.videoPlayerDidCompleteLoop(identifier: identifier)
+            return
+        }
         if !lapSignaled {
             lapSignaled = true
             delegate?.videoPlayerDidCompleteLoop(identifier: identifier)
@@ -287,6 +339,7 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
         player.pause()
         removeSectionEndObserver()
         lapSignaled = false
+        hasFinishedSection = false
         player.replaceCurrentItem(with: nil) // We need to do this or we'll get a stray frame during the renderLoop even when the video isn't active.
         lastPixelBuffer = nil
         if let observer = playbackEndObserver {
@@ -302,52 +355,78 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
     public func stopVideo(pausePlayer: Bool) { stopVideo() }
     
     
+    // MARK: - Frames
+
+    /// What a frame check found at the item's current time.
+    private enum Frame {
+        /// Nothing new since the last check.
+        case none
+        /// A frame to present.
+        case new(CVPixelBuffer)
+        /// A frame at or past the section's out-point. It belongs to no lap,
+        /// so the frame before it stays on screen.
+        case pastOutPoint
+        /// AVFoundation said a frame was ready, then could not hand it over.
+        case failed
+    }
+
+    /// The frame for `time`, unless it starts at or after the section's `end`.
+    ///
+    /// This is what makes an out-point frame-exact: a section `[start, end)`
+    /// shows its last frame before `end` and never the frame AT `end`, however
+    /// late the boundary observer lands. Before 2.2.0 the clock could reach the
+    /// out-point frame before the lap was signalled, so it showed for a frame
+    /// (a trimmed clip's next second flashed at every loop). `end` is read by
+    /// the caller, on the caller's thread.
+    private static func frame(from output: AVPlayerItemVideoOutput, at time: CMTime, end: Double?) -> Frame {
+        guard output.hasNewPixelBuffer(forItemTime: time) else { return .none }
+        var shownAt = CMTime.invalid
+        guard let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &shownAt) else {
+            return .failed
+        }
+        if let end, shownAt.isNumeric, shownAt.seconds >= end - outPointTolerance { return .pastOutPoint }
+        return .new(buffer)
+    }
+
     // This could be called from the render loop instead of the direct methods below.
     public func indirectBufferCheck() {
         guard let videoOutput else {
-            
             delegate?.VideoPlayerBuffer(pixelBuffer: lastPixelBuffer)
-            return  }
-        if videoOutput.hasNewPixelBuffer(forItemTime: player.currentTime()) {
-            if let pixelBuffer = videoOutput.copyPixelBuffer(forItemTime: player.currentTime(), itemTimeForDisplay: nil) {
-                lastPixelBuffer = pixelBuffer
-                delegate?.VideoPlayerBuffer(pixelBuffer: pixelBuffer)
-            } else {
-                mlog.error("indirectBufferCheck: cannot convert pixel buffer")
-                delegate?.VideoPlayerBuffer(pixelBuffer: lastPixelBuffer)
-            }
-        } else {
-            delegate?.VideoPlayerBuffer(pixelBuffer: lastPixelBuffer)
+            return
         }
+        switch Self.frame(from: videoOutput, at: player.currentTime(), end: section.end) {
+        case .new(let pixelBuffer):
+            lastPixelBuffer = pixelBuffer
+        case .failed:
+            mlog.error("indirectBufferCheck: cannot convert pixel buffer")
+        case .none, .pastOutPoint:
+            break
+        }
+        delegate?.VideoPlayerBuffer(pixelBuffer: lastPixelBuffer)
     }
-    
+
     /// Direct buffer check - optimized for synchronous calls from render loop
-    /// Returns pixel buffer immediately if available, or the last cached buffer if no new frame
+    /// Returns pixel buffer immediately if available, or the last cached buffer if no new frame.
+    /// A frame at or past the section's out-point is never returned: the one
+    /// before it is (see ``frame(from:at:end:)``).
     public func directBufferCheck() -> CVPixelBuffer? {
         guard let videoOutput else { return lastPixelBuffer }
-        
-        let currentTime = player.currentTime()
-        
-        // Check if there's a new pixel buffer available
-        if videoOutput.hasNewPixelBuffer(forItemTime: currentTime) {
-            if let pixelBuffer = videoOutput.copyPixelBuffer(forItemTime: currentTime, itemTimeForDisplay: nil) {
-                // Cache the new buffer and return it
-                lastPixelBuffer = pixelBuffer
-                return pixelBuffer
-            } else {
-                mlog.error("directBufferCheck [\(self.identifier)]: cannot convert pixel buffer")
-                // Return cached buffer as fallback
-                return lastPixelBuffer
-            }
-        } else {
-            // No new buffer available, return the cached one
-            return lastPixelBuffer
+        switch Self.frame(from: videoOutput, at: player.currentTime(), end: section.end) {
+        case .new(let pixelBuffer):
+            lastPixelBuffer = pixelBuffer
+        case .failed:
+            mlog.error("directBufferCheck [\(self.identifier)]: cannot convert pixel buffer")
+        case .none, .pastOutPoint:
+            break
         }
+        return lastPixelBuffer
     }
 
     /// Asynchronous buffer check using dedicated processing queue
-    /// Calls completion handler with pixel buffer on the processing queue
+    /// Calls completion handler with pixel buffer on the processing queue,
+    /// or nil when there is no new frame to show.
     public func asyncBufferCheck(completion: @escaping @Sendable (CVPixelBuffer?) -> Void) {
+        let end = section.end   // read here, where `section` is written, not on the queue
         processingQueue.async { [weak self] in
             guard let self = self else {
                 completion(nil)
@@ -357,19 +436,15 @@ public class VideoPlayer: NSObject, @unchecked Sendable {
                 completion(nil)
                 return
             }
-            let currentTime = self.player.currentTime()
-            if videoOutput.hasNewPixelBuffer(forItemTime: currentTime) {
-                if let pixelBuffer = videoOutput.copyPixelBuffer(forItemTime: currentTime, itemTimeForDisplay: nil) {
-                    completion(pixelBuffer)
-                } else {
-                    mlog.error("asyncBufferCheck [\(self.identifier)]: cannot convert pixel buffer")
-                    completion(nil)
-                }
-            } else {
+            switch Self.frame(from: videoOutput, at: self.player.currentTime(), end: end) {
+            case .new(let pixelBuffer):
+                completion(pixelBuffer)
+            case .failed:
+                mlog.error("asyncBufferCheck [\(self.identifier)]: cannot convert pixel buffer")
+                completion(nil)
+            case .none, .pastOutPoint:
                 completion(nil)
             }
         }
     }
 }
-
-

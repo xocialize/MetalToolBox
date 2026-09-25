@@ -46,3 +46,18 @@ public struct PlaybackSection: Equatable, Sendable {
     /// The least a clamped section keeps in front of the file's end (seconds).
     static let minimumClip: Double = 0.05
 }
+
+/// What a ``VideoPlayer`` does when a section ends (2.2.0).
+public enum SectionEndAction: Equatable, Sendable {
+    /// Signal a lap, return to the section's start and keep playing. The
+    /// default, and the only behaviour before 2.2.0: a preview that loops a
+    /// trimmed clip wants this.
+    case loop
+    /// Signal once and stop ON the section's last frame. Nothing plays until the
+    /// next ``VideoPlayer/play(url:section:)``, and a resume does not play on
+    /// past the out-point. A sequencer that decides what follows each clip (a
+    /// hold, the next clip, or the end of a show) wants this: with `.loop` the
+    /// lap has already returned to the start by the time it decides, so a hold
+    /// would freeze on the section's FIRST frame.
+    case hold
+}
