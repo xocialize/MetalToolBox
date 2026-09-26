@@ -440,12 +440,19 @@ public class TextureCompositorEngine {
         fullScreenDescriptor.fragmentFunction = fragmentFunction
         fullScreenDescriptor.colorAttachments[0].pixelFormat = pixelFormat
 
-        // Alpha blending: standard source-over for transparency
+        // Alpha blending: straight-alpha source-over. Zone textures are STRAIGHT alpha (MPS scales them as
+        // they come); the output accumulates PREMULTIPLIED over a canvas cleared to transparent black, which is
+        // what EnhancedMetalView's one / oneMinusSourceAlpha pipeline displays:
+        //     rgb = src.rgb · src.a + dst.rgb · (1 − src.a)
+        //     a   = src.a   · 1     + dst.a   · (1 − src.a)
+        // The alpha source factor is `.one`, not `.sourceAlpha`: with `.sourceAlpha` the output alpha came out as
+        // src.a² — measured 2026-09-26 with a white 4×4 at alpha 128 composed alone: colour 128, alpha 64 — so a
+        // 50 % shadow or glow displayed at 25 %. Opaque signage never showed it (1² = 1). See CompositeAlphaTests.
         fullScreenDescriptor.colorAttachments[0].isBlendingEnabled = true
         fullScreenDescriptor.colorAttachments[0].rgbBlendOperation = .add
         fullScreenDescriptor.colorAttachments[0].alphaBlendOperation = .add
         fullScreenDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        fullScreenDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        fullScreenDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
         fullScreenDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         fullScreenDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
