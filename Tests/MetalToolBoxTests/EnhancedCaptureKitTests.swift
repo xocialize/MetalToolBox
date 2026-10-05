@@ -125,6 +125,7 @@ final class EnhancedCaptureTypesTests: XCTestCase {
         XCTAssertEqual(config.screenFrameRate, 30)
         XCTAssertTrue(config.screenShowsCursor)
         XCTAssertFalse(config.screenAudioEnabled)
+        XCTAssertFalse(config.screenCapturesAtPixelResolution, "display frames came at the point size before 2.3.0")
         XCTAssertEqual(config.cameraRotationMode, .none, "buffers were sensor-oriented before configuration existed")
         #if os(macOS)
         XCTAssertTrue(config.audioPreviewEnabled, "macOS speaker preview was always on before configuration existed")

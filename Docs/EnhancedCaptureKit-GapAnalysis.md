@@ -124,6 +124,12 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
   if ScreenCaptureKit refuses), and a display change that lands mid-scan runs one more
   pass instead of being dropped (`ScreenScanGate`). `EnhancedCaptureScreenTests` resizes a
   live stream of the main display when Screen Recording is already granted.
+- **Display capture at the display's pixel resolution** (2.3.0, opt-in:
+  `screenCapturesAtPixelResolution`). Frames came at the display's point size, so a Retina
+  display that looks like 1512 × 982 arrived at 1512 × 982 — half its 3024 × 1964 pixels each
+  way. On, a stream is its display's points × `SCContentFilter.pointPixelScale`, at its start
+  and after every display change (four times the pixels per frame on a Retina display). Off
+  by default: the size display frames always had.
 - **Screen-recording permission** reports the real `CGRequestScreenCaptureAccess()`
   result instead of always `.denied`.
 - **Audio-only devices** are discovered as `.microphone` sources only when

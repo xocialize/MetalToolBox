@@ -2,8 +2,8 @@
 //  EnhancedCaptureScreenTests.swift
 //  MetalToolBox
 //
-//  Display capture following its display (2.2.2): the size rule and the scan gate, then a
-//  live stream of the main display re-configured to another size. The live test needs
+//  Display capture following its display (2.2.2) and at its pixel resolution (2.3.0): the
+//  size rules and the scan gate, then live streams of the main display. The live test needs
 //  Screen Recording already granted to the process running it; it never prompts, and
 //  skips without it. Frames are read for their size only and never kept.
 //
@@ -40,6 +40,25 @@ final class ScreenStreamSizeTests: XCTestCase {
 
     func testSizesDescribeThemselves() {
         XCTAssertEqual(wide.description, "1920×1080")
+    }
+
+    func testAStreamIsThePointSizeUnlessPixelsAreAskedFor() {
+        let retina = ScreenDisplayGeometry(width: 1512, height: 982, pixelScale: 2)
+        XCTAssertEqual(ScreenStreamSize(display: retina, atPixelResolution: false), laptop)
+        XCTAssertEqual(ScreenStreamSize(display: retina, atPixelResolution: true), ScreenStreamSize(width: 3024, height: 1964))
+        // A 16:9 mode on the same panel: its own pixels, so the shape follows too.
+        let wideRetina = ScreenDisplayGeometry(width: 1920, height: 1080, pixelScale: 2)
+        XCTAssertEqual(ScreenStreamSize(display: wideRetina, atPixelResolution: true), ScreenStreamSize(width: 3840, height: 2160))
+    }
+
+    func testANonRetinaOrUnknownScaleKeepsThePoints() {
+        XCTAssertEqual(ScreenStreamSize(display: ScreenDisplayGeometry(width: 1920, height: 1080, pixelScale: 1), atPixelResolution: true), wide)
+        XCTAssertEqual(ScreenStreamSize(display: ScreenDisplayGeometry(width: 1920, height: 1080, pixelScale: 0), atPixelResolution: true), wide)
+    }
+
+    func testAFractionalScaleRounds() {
+        XCTAssertEqual(ScreenStreamSize(display: ScreenDisplayGeometry(width: 1001, height: 563, pixelScale: 1.5), atPixelResolution: true),
+                       ScreenStreamSize(width: 1502, height: 845))
     }
 }
 
@@ -79,9 +98,10 @@ final class ScreenScanGateTests: XCTestCase {
 }
 
 #if os(macOS)
-/// A real stream of the main display: started at the display's size, re-configured to a
-/// smaller one of another shape and back, as a resolution change does. The frames must
-/// arrive in each new size — what a compositor laying out by the frame's size needs.
+/// Real streams of the main display: started at the display's size, re-configured to a
+/// smaller one of another shape and back, as a resolution change does — at the point size,
+/// then at the pixel resolution. The frames must arrive in each new size: what a compositor
+/// laying out by the frame's size needs.
 final class EnhancedCaptureScreenLiveTests: XCTestCase {
 
     private final class Recorder: EnhancedCaptureScreenDelegate, @unchecked Sendable {
@@ -111,32 +131,57 @@ final class EnhancedCaptureScreenLiveTests: XCTestCase {
     }
 
     func testTheStreamFollowsADisplaySizeChange() async throws {
+        try await followsADisplaySizeChange(atPixelResolution: false)
+    }
+
+    func testAtPixelResolutionTheStreamIsTheDisplaysPixelsAndFollowsToo() async throws {
+        try await followsADisplaySizeChange(atPixelResolution: true)
+    }
+
+    /// The main display's pixels per point, read from its display mode — CoreGraphics, not
+    /// the ScreenCaptureKit value the kit uses, so the test checks the kit against another source.
+    private func modeScale(_ displayID: CGDirectDisplayID) -> Double {
+        guard let mode = CGDisplayCopyDisplayMode(displayID), mode.width > 0 else { return 1 }
+        return Double(mode.pixelWidth) / Double(mode.width)
+    }
+
+    private func followsADisplaySizeChange(atPixelResolution: Bool) async throws {
         try XCTSkipUnless(CGPreflightScreenCaptureAccess(), "needs Screen Recording granted to the test runner (never prompted for)")
 
         let displayID = CGMainDisplayID()
         let recorder = Recorder()
-        let screen = EnhancedCaptureScreen(delegate: recorder, displayId: displayID)
+        var options = EnhancedCaptureScreen.Options()
+        options.capturesAtPixelResolution = atPixelResolution
+        let screen = EnhancedCaptureScreen(delegate: recorder, displayId: displayID, options: options)
         defer { screen.stopCapture() }
 
         let bounds = CGDisplayBounds(displayID).size
-        let native = ScreenStreamSize(width: Int(bounds.width), height: Int(bounds.height))
+        let scale = modeScale(displayID)
+        let display = ScreenDisplayGeometry(width: Int(bounds.width), height: Int(bounds.height), pixelScale: scale)
+        let native = atPixelResolution
+            ? ScreenStreamSize(width: Int((bounds.width * scale).rounded()), height: Int((bounds.height * scale).rounded()))
+            : ScreenStreamSize(width: Int(bounds.width), height: Int(bounds.height))
         screen.startCapture()
         let first = await waitForFrame(of: native, from: recorder)
         XCTAssertTrue(first, "no frame at the display's size \(native); last \(String(describing: recorder.last))")
 
-        // As if the display went to a 16:9 mode: a size of another shape than the native one.
-        let wide = ScreenStreamSize(width: 1280, height: 720)
+        // As if the display went to a 16:9 mode: a size of another shape than the native one,
+        // on a Retina panel (2 pixels per point) — at pixel resolution its frames are 2560 × 1440,
+        // whatever this Mac's own displays are.
+        let wideDisplay = ScreenDisplayGeometry(width: 1280, height: 720, pixelScale: 2)
+        // Written out, not computed by the rule under test.
+        let wide = atPixelResolution ? ScreenStreamSize(width: 2560, height: 1440) : ScreenStreamSize(width: 1280, height: 720)
         recorder.reset()
-        let resized = await screen.displayDidChange(to: wide)
+        let resized = await screen.displayDidChange(to: wideDisplay)
         XCTAssertTrue(resized)
         let arrivedWide = await waitForFrame(of: wide, from: recorder)
         XCTAssertTrue(arrivedWide, "frames did not follow to \(wide); last \(String(describing: recorder.last))")
 
-        // The same size again changes nothing; back to the native size follows again.
-        let unchanged = await screen.displayDidChange(to: wide)
+        // The same display again changes nothing; back to the native one follows again.
+        let unchanged = await screen.displayDidChange(to: wideDisplay)
         XCTAssertFalse(unchanged)
         recorder.reset()
-        let restored = await screen.displayDidChange(to: native)
+        let restored = await screen.displayDidChange(to: display)
         XCTAssertTrue(restored)
         let arrivedNative = await waitForFrame(of: native, from: recorder)
         XCTAssertTrue(arrivedNative, "frames did not follow back to \(native); last \(String(describing: recorder.last))")

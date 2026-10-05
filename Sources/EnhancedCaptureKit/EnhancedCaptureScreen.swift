@@ -30,6 +30,8 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
         var showsCursor: Bool = true
         var capturesAudio: Bool = false
         var pixelFormat: OSType = kCVPixelFormatType_32BGRA
+        /// Frames at the display's pixel resolution rather than its point size (2.3.0).
+        var capturesAtPixelResolution: Bool = false
     }
 
     // MARK: - CaptureSource / displayID
@@ -184,8 +186,8 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 }
 
                 let filter = Self.filter(for: display, in: content)
-                let size = ScreenStreamSize(width: display.width, height: display.height)
                 let options = self.options
+                let size = ScreenStreamSize(display: Self.geometry(of: display), atPixelResolution: options.capturesAtPixelResolution)
                 let config = Self.configuration(size: size, options: options)
 
                 mlog.debug("[EnhancedCaptureScreen] Stream config: \(size) @ \(options.frameRate) fps, audio: \(options.capturesAudio)")
@@ -256,8 +258,9 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
 
 extension EnhancedCaptureScreen {
 
-    /// The display's size is now `display` (the kit's screen scan reads it after every
-    /// display change). A running stream of another size is re-configured to it — the
+    /// The display is now `display` (the kit's screen scan reads it after every display
+    /// change). A running stream of another size than the one it calls for — its points, or
+    /// its pixels when the options ask for them — is re-configured to it — the
     /// filter re-made from the display as it is now, then the output size — so its next
     /// frames arrive in the display's new shape and a consumer that lays out by the frame's
     /// size sees the change (``ScreenStreamSize/resized(stream:display:)``). Before 2.2.2 the
@@ -267,8 +270,9 @@ extension EnhancedCaptureScreen {
     /// Returns whether the stream was re-configured. When ScreenCaptureKit refuses the new
     /// configuration the stream is restarted instead, which reads the display afresh.
     @discardableResult
-    func displayDidChange(to display: ScreenStreamSize) async -> Bool {
-        guard let stream, let newSize = ScreenStreamSize.resized(stream: streamSize, display: display) else { return false }
+    func displayDidChange(to display: ScreenDisplayGeometry) async -> Bool {
+        let wanted = ScreenStreamSize(display: display, atPixelResolution: options.capturesAtPixelResolution)
+        guard let stream, let newSize = ScreenStreamSize.resized(stream: streamSize, display: wanted) else { return false }
         let oldSize = streamSize.map(String.init(describing:)) ?? "none"
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -297,6 +301,13 @@ extension EnhancedCaptureScreen {
             stopCapture { resume.resume() }
         }
         startCapture()
+    }
+
+    /// The display's size in points and its pixels per point, as the stream start and the
+    /// kit's scan both read it.
+    static func geometry(of display: SCDisplay) -> ScreenDisplayGeometry {
+        ScreenDisplayGeometry(width: display.width, height: display.height,
+                              pixelScale: Double(SCContentFilter(display: display, excludingWindows: []).pointPixelScale))
     }
 
     /// The display, less this application's own windows (a Surface must not mirror itself).

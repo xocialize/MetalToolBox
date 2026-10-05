@@ -165,6 +165,12 @@ public struct EnhancedCaptureConfiguration: Sendable, Equatable {
     /// Draw the cursor into display captures (macOS).
     public var screenShowsCursor: Bool = true
 
+    /// Capture displays at their pixel resolution, not their point size (macOS, 2.3.0).
+    /// A Retina display that "looks like" 1512 × 982 is 3024 × 1964 pixels: off, its frames
+    /// arrive at the point size, half its pixels each way; on, at the full resolution — four
+    /// times the pixels per frame. Off by default: the size display frames always had.
+    public var screenCapturesAtPixelResolution: Bool = false
+
     // MARK: Depth (iOS / iPadOS)
 
     /// Deliver `AVDepthData` from cameras that have a depth sensor (LiDAR on

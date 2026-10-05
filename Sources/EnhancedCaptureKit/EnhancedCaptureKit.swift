@@ -819,11 +819,11 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
 
         // A display still here may have changed size (a resolution or mode change keeps its
         // ID): its stream, if one runs, is re-configured to the new size.
-        let sizes = Dictionary(content.displays.map { ($0.displayID, ScreenStreamSize(width: $0.width, height: $0.height)) },
-                               uniquingKeysWith: { first, _ in first })
+        let geometries = Dictionary(content.displays.map { ($0.displayID, EnhancedCaptureScreen.geometry(of: $0)) },
+                                    uniquingKeysWith: { first, _ in first })
         for screen in captureScreens {
-            guard let displayID = screen.displayID, let size = sizes[displayID] else { continue }
-            await screen.displayDidChange(to: size)
+            guard let displayID = screen.displayID, let geometry = geometries[displayID] else { continue }
+            await screen.displayDidChange(to: geometry)
         }
 
     }
@@ -844,6 +844,7 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
         // microphone, so it does not depend on `audioEnabled`.
         options.capturesAudio = configuration.screenAudioEnabled && configuration.deliversAudioSampleBuffers
         options.pixelFormat = configuration.pixelFormat.coreVideoType
+        options.capturesAtPixelResolution = configuration.screenCapturesAtPixelResolution
         let newCapture = EnhancedCaptureScreen(delegate: self, displayId: displayId, options: options)
         guard let _ = newCapture.captureSource else {
             mlog.error("Failed to create capture source for display \(displayId)")

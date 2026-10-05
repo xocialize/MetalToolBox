@@ -32,6 +32,24 @@ struct ScreenStreamSize: Equatable, Sendable, CustomStringConvertible {
     }
 }
 
+/// A display as a scan reads it: its size in points (`SCDisplay.width` / `.height`) and its
+/// pixels per point (`SCContentFilter.pointPixelScale`: 2 on a Retina display, 1 otherwise).
+struct ScreenDisplayGeometry: Equatable, Sendable {
+    var width: Int
+    var height: Int
+    var pixelScale: Double
+}
+
+extension ScreenStreamSize {
+    /// The size a stream of `display` delivers: its points, or its pixels when
+    /// `atPixelResolution` (2.3.0). A scale that is not known (0) counts as 1.
+    init(display: ScreenDisplayGeometry, atPixelResolution: Bool) {
+        let scale = atPixelResolution && display.pixelScale > 0 ? display.pixelScale : 1
+        self.init(width: Int((Double(display.width) * scale).rounded()),
+                  height: Int((Double(display.height) * scale).rounded()))
+    }
+}
+
 /// One screen scan at a time, and never a change missed.
 ///
 /// macOS posts `didChangeScreenParametersNotification` more than once during one display
