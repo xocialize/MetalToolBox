@@ -57,6 +57,11 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
 
     nonisolated(unsafe) private var stream: SCStream?
 
+    /// The size the running stream delivers, nil while none runs. ScreenCaptureKit keeps a
+    /// stream at its configured size whatever its display does, so a display change has to
+    /// re-configure it (`displayDidChange`).
+    nonisolated(unsafe) private var streamSize: ScreenStreamSize?
+
     // Synchronization lock for capture state
     private let stateLock = NSLock()
     nonisolated(unsafe) private var _isCaptureActive = false
@@ -178,30 +183,12 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                     return
                 }
 
-                // Exclude this application
-                let excludedApps = content.applications.filter { app in
-                    Bundle.main.bundleIdentifier == app.bundleIdentifier
-                }
-
-                // Create filter
-                let filter = SCContentFilter(
-                    display: display,
-                    excludingApplications: excludedApps,
-                    exceptingWindows: []
-                )
-
-                // Configure stream
+                let filter = Self.filter(for: display, in: content)
+                let size = ScreenStreamSize(width: display.width, height: display.height)
                 let options = self.options
-                let config = SCStreamConfiguration()
-                config.width = display.width
-                config.height = display.height
-                config.pixelFormat = options.pixelFormat
-                config.minimumFrameInterval = CMTime(value: 1, timescale: max(1, options.frameRate))
-                config.showsCursor = options.showsCursor
-                config.capturesAudio = options.capturesAudio
-                config.excludesCurrentProcessAudio = true
+                let config = Self.configuration(size: size, options: options)
 
-                mlog.debug("[EnhancedCaptureScreen] Stream config: \(config.width)x\(config.height) @ \(options.frameRate) fps, audio: \(options.capturesAudio)")
+                mlog.debug("[EnhancedCaptureScreen] Stream config: \(size) @ \(options.frameRate) fps, audio: \(options.capturesAudio)")
 
                 // Create stream
                 let captureStream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -214,6 +201,7 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 try await captureStream.startCapture()
 
                 stream = captureStream
+                streamSize = size
                 isCaptureActive = true
 
                 mlog.info("[EnhancedCaptureScreen] Screen capture started successfully")
@@ -247,11 +235,13 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
             do {
                 try await stream.stopCapture()
                 self.stream = nil
+                streamSize = nil
                 isCaptureActive = false
                 mlog.info("[EnhancedCaptureScreen] Screen capture stopped")
             } catch {
                 mlog.error("[EnhancedCaptureScreen] Failed to stop screen capture: \(error.localizedDescription)")
                 self.stream = nil
+                streamSize = nil
                 isCaptureActive = false
             }
             delegate?.enhancedCaptureScreen(self, didChangeState: .idle)
@@ -259,6 +249,73 @@ public class EnhancedCaptureScreen: NSObject, @unchecked Sendable {
                 DispatchQueue.main.async { completion() }
             }
         }
+    }
+}
+
+// MARK: - Display changes
+
+extension EnhancedCaptureScreen {
+
+    /// The display's size is now `display` (the kit's screen scan reads it after every
+    /// display change). A running stream of another size is re-configured to it — the
+    /// filter re-made from the display as it is now, then the output size — so its next
+    /// frames arrive in the display's new shape and a consumer that lays out by the frame's
+    /// size sees the change (``ScreenStreamSize/resized(stream:display:)``). Before 2.2.2 the
+    /// stream kept the size it started with: a 16:10 laptop switched to 16:9 was mirrored
+    /// 16:10, the desktop letterboxed inside each frame.
+    ///
+    /// Returns whether the stream was re-configured. When ScreenCaptureKit refuses the new
+    /// configuration the stream is restarted instead, which reads the display afresh.
+    @discardableResult
+    func displayDidChange(to display: ScreenStreamSize) async -> Bool {
+        guard let stream, let newSize = ScreenStreamSize.resized(stream: streamSize, display: display) else { return false }
+        let oldSize = streamSize.map(String.init(describing:)) ?? "none"
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard let displayID, let scDisplay = content.displays.first(where: { $0.displayID == displayID }) else {
+                mlog.warning("[EnhancedCaptureScreen] Display \(String(describing: self.displayID)) changed but is not listed — stream left as it is")
+                return false
+            }
+            // The size is the scan's reading, taken in the same pass; a change after it is
+            // read by the next pass (the kit's ScreenScanGate runs one when a change lands
+            // mid-scan).
+            try await stream.updateContentFilter(Self.filter(for: scDisplay, in: content))
+            try await stream.updateConfiguration(Self.configuration(size: newSize, options: options))
+            streamSize = newSize
+            mlog.info("[EnhancedCaptureScreen] Display \(displayID) changed size \(oldSize) → \(newSize) — stream re-configured")
+            return true
+        } catch {
+            mlog.error("[EnhancedCaptureScreen] Re-configuring the stream for \(newSize) failed: \(error.localizedDescription) — restarting it")
+            await restart()
+            return false
+        }
+    }
+
+    /// Stops the stream, then starts it again from the display as it is now.
+    private func restart() async {
+        await withCheckedContinuation { (resume: CheckedContinuation<Void, Never>) in
+            stopCapture { resume.resume() }
+        }
+        startCapture()
+    }
+
+    /// The display, less this application's own windows (a Surface must not mirror itself).
+    static func filter(for display: SCDisplay, in content: SCShareableContent) -> SCContentFilter {
+        let excludedApps = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
+        return SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
+    }
+
+    /// The stream's configuration at `size`, the rest from the options fixed at discovery.
+    static func configuration(size: ScreenStreamSize, options: Options) -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.width = size.width
+        config.height = size.height
+        config.pixelFormat = options.pixelFormat
+        config.minimumFrameInterval = CMTime(value: 1, timescale: max(1, options.frameRate))
+        config.showsCursor = options.showsCursor
+        config.capturesAudio = options.capturesAudio
+        config.excludesCurrentProcessAudio = true
+        return config
     }
 }
 
@@ -270,6 +327,7 @@ extension EnhancedCaptureScreen: SCStreamDelegate {
         mlog.error("[EnhancedCaptureScreen] Stream stopped with error: \(error.localizedDescription)")
         isCaptureActive = false
         self.stream = nil
+        streamSize = nil
         delegate?.enhancedCaptureScreen(self, didChangeState: .error(.streamInterrupted(reason: error.localizedDescription)))
     }
 }

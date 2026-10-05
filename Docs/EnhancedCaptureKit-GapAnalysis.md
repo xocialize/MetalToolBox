@@ -115,6 +115,15 @@ copied, so the Apache 2.0 NOTICE obligation is not triggered).
   joins the session (AVFoundation resets it at that moment on iOS).
 - **Display capture** forwards only `SCFrameStatus.complete` frames. Idle/blank/suspended
   frames carry no new pixels and used to trigger a GPU upload each.
+- **Display capture follows its display's size** (2.2.2). A stream's output size was set
+  once, at its start, and the screen scan only noticed displays added or removed, so a
+  display switched to a mode of another shape (a 16:10 laptop set to 16:9) kept arriving
+  in the old shape, the new desktop letterboxed inside each frame — and a compositor laying
+  out by the frame's size never re-fitted it. The scan now re-configures a running stream
+  to its display's new size (`EnhancedCaptureScreen.displayDidChange(to:)`, restarting it
+  if ScreenCaptureKit refuses), and a display change that lands mid-scan runs one more
+  pass instead of being dropped (`ScreenScanGate`). `EnhancedCaptureScreenTests` resizes a
+  live stream of the main display when Screen Recording is already granted.
 - **Screen-recording permission** reports the real `CGRequestScreenCaptureAccess()`
   result instead of always `.denied`.
 - **Audio-only devices** are discovered as `.microphone` sources only when

@@ -761,19 +761,26 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
 
     // MARK: - Screen Discovery
 #if os(macOS)
-    private var isUpdatingScreens = false
+    /// One scan at a time; a display change during a scan runs one more pass after it
+    /// (``ScreenScanGate``: macOS posts several notifications during one mode change, and
+    /// the last state is the one that must be read).
+    private var screenScan = ScreenScanGate()
 
     @MainActor
     func screensDidUpdate() async {
-        // Prevent concurrent calls to this method
-        guard !isUpdatingScreens else {
-            mlog.debug("Screens update already in progress, skipping")
+        guard screenScan.request() else {
+            mlog.debug("Screens update already in progress — another pass will follow it")
             return
         }
+        repeat {
+            await scanScreens()
+        } while screenScan.passEnded()
+    }
 
-        isUpdatingScreens = true
-        defer { isUpdatingScreens = false }
-
+    /// Displays added, displays gone, and displays that changed size (2.2.2): a running
+    /// stream follows its display's new shape (``EnhancedCaptureScreen/displayDidChange(to:)``).
+    @MainActor
+    private func scanScreens() async {
         // Get list of active display IDs from existing capture screens
         let activeDisplays = captureScreens.compactMap { $0.displayID }
 
@@ -808,6 +815,15 @@ public final class EnhancedCaptureKit: NSObject, @unchecked Sendable {
             if !currentDisplayIds.contains(displayId) {
                 screenLost(displayId: displayId)
             }
+        }
+
+        // A display still here may have changed size (a resolution or mode change keeps its
+        // ID): its stream, if one runs, is re-configured to the new size.
+        let sizes = Dictionary(content.displays.map { ($0.displayID, ScreenStreamSize(width: $0.width, height: $0.height)) },
+                               uniquingKeysWith: { first, _ in first })
+        for screen in captureScreens {
+            guard let displayID = screen.displayID, let size = sizes[displayID] else { continue }
+            await screen.displayDidChange(to: size)
         }
 
     }
